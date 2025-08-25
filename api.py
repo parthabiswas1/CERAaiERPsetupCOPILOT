@@ -110,3 +110,29 @@ def map_to_fusion(payload: dict, credentials: HTTPBasicCredentials = Depends(sec
     mapped = build_fusion_payload(payload)
     return {"status": "ok", "mapped": mapped}
 
+import random
+
+@app.post("/execute")
+def execute(payload: dict, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    endpoint = payload.get("endpoint", "/legalEntities")
+    body = payload.get("body", {})
+
+    # generate deterministic fake IDs
+    le_id = f"LE-{random.randint(1000, 9999)}"
+    reg_ids = []
+    for i, reg in enumerate(body.get("registrations", []), start=1):
+        reg_ids.append({
+            "type": reg.get("type"),
+            "id": f"REG-{i}-{random.randint(100,999)}"
+        })
+
+    result = {
+        "executed_endpoint": endpoint,
+        "legalEntityId": le_id,
+        "registrations": reg_ids,
+        "status": "success"
+    }
+    return result
