@@ -6,11 +6,19 @@ from typing import Dict
 import json
 from ceraai.tools import RAGTool
 from ceraai.agents import InterviewAgent
+from ceraai.tools import RAGTool, RulesTool
+from ceraai.agents import InterviewAgent, ValidatorAgent
+
 
 app = FastAPI(title="CERAai ERP Setup Copilot - MVP")
 security = HTTPBasic()
 
 DB_PATH = "rules.sqlite"
+
+rag = RAGTool()
+rules_tool = RulesTool()
+interview_agent = InterviewAgent()
+validator_agent = ValidatorAgent()
 
 def init_db():
     con = sqlite3.connect(DB_PATH)
