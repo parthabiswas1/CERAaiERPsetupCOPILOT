@@ -46,10 +46,12 @@ class ExecutorAgent:
 
 
 class AuditorAgent:
-    def record(self, event: Dict, audit: AuditTool) -> None:
-        audit.log(event)
+    def record(self, event: Dict, audit: AuditTool) -> Dict:
+        audit.log(event); return {"logged": True}
 
-# ceraai/agents.py
+    def fetch(self, audit: AuditTool, limit: int = 200) -> Dict:
+        return {"logs": audit.read(limit)}
+
 
 class MapperAgent:
     def map_to_fusion(self, inputs: Dict) -> Dict:
