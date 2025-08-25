@@ -1,0 +1,22 @@
+[
+  {
+    "id": "ein-us",
+    "tags": ["US","LegalEntity","Registration","EIN"],
+    "text": "For U.S. legal entities, an Employer Identification Number (EIN) is required for tax registrations."
+  },
+  {
+    "id": "ca-edd",
+    "tags": ["US","CA","Employment","Registration","EDD"],
+    "text": "If employees are in California, a CA EDD Employer Payroll Tax Account Number is required."
+  },
+  {
+    "id": "legal-address",
+    "tags": ["US","Address"],
+    "text": "Create a legal address record before creating the legal entity payload."
+  },
+  {
+    "id": "sequence",
+    "tags": ["Fusion","Sequence"],
+    "text": "Sequence: Address → Legal Entity → Registrations → (LRUs/HCM) → BSV assignment."
+  }
+]
