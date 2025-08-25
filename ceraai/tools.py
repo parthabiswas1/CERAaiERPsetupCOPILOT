@@ -1,6 +1,7 @@
 # ceraai/tools.py
 from typing import Dict, List
 import json, os, re
+import sqlite3
 
 PACK_PATH = os.path.join("knowledge", "pack_us_tech.json")
 
@@ -24,9 +25,30 @@ class RAGTool:
         ranked = sorted(self.docs, key=score, reverse=True)
         return [{"id": d["id"], "snippet": d["text"], "tags": d.get("tags", [])} for d in ranked[:top_k]]
 
+
 class RulesTool:
     def __init__(self, db_path: str = "rules.sqlite"):
         self.db_path = db_path
+
+    def compute_missing(self, payload: Dict) -> List[Dict]:
+        country = str(payload.get("country", "")).upper()
+        flags = {k: str(v).lower() for k, v in payload.items()}
+        con = sqlite3.connect(self.db_path); cur = con.cursor()
+        cur.execute("""
+            SELECT country, condition_key, condition_value, field, mandatory, message
+            FROM rules
+            WHERE country=? OR country IS NULL
+        """, (country,))
+        rows = cur.fetchall(); con.close()
+
+        missing = []
+        for (_country, ckey, cval, field, mandatory, msg) in rows:
+            if ckey and str(flags.get(ckey, "false")) != str(cval):
+                continue
+            if mandatory and not payload.get(field):
+                missing.append({"field": field, "message": msg})
+        return missing
+
 
 class ERPConnector:
     def create_legal_entity(self, payload: Dict) -> Dict:
