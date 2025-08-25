@@ -3,6 +3,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import JSONResponse
 import sqlite3, os, hashlib, time
 from typing import Dict
+import json
 
 app = FastAPI(title="CERAai ERP Setup Copilot - MVP")
 security = HTTPBasic()
@@ -136,3 +137,30 @@ def execute(payload: dict, credentials: HTTPBasicCredentials = Depends(security)
         "status": "success"
     }
     return result
+
+
+LOG_FILE = "audit_log.jsonl"
+
+def write_audit(entry: dict):
+    entry["timestamp"] = int(time.time())
+    with open(LOG_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+@app.post("/audit")
+def audit(event: dict, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    write_audit(event)
+    return {"logged": True}
+
+@app.get("/audit/logs")
+def get_audit(credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    logs = []
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE) as f:
+            for line in f:
+                logs.append(json.loads(line))
+    return {"logs": logs}
+
