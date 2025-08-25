@@ -4,8 +4,8 @@ from fastapi.responses import JSONResponse
 import sqlite3, os, hashlib, time
 from typing import Dict
 import json
-from ceraai.tools import RAGTool, RulesTool, ERPConnector
-from ceraai.agents import InterviewAgent, ValidatorAgent, MapperAgent, ExecutorAgent
+from ceraai.tools import RAGTool, RulesTool, ERPConnector, AuditTool
+from ceraai.agents import InterviewAgent, ValidatorAgent, MapperAgent, ExecutorAgent, AuditorAgent
 import random
 
 
@@ -20,6 +20,9 @@ interview_agent = InterviewAgent()
 validator_agent = ValidatorAgent()
 executor_agent  = ExecutorAgent()
 erp_connector   = ERPConnector()
+auditor_agent   = AuditorAgent()
+audit_tool      = AuditTool()
+
 
 def init_db():
     con = sqlite3.connect(DB_PATH)
@@ -71,9 +74,6 @@ def validate(payload: dict, credentials: HTTPBasicCredentials = Depends(security
         raise HTTPException(status_code=401, detail="Unauthorized")
     return validator_agent.validate(payload, rules_tool)
 
-
-
-
 @app.post("/execute")
 def execute(payload: dict, credentials: HTTPBasicCredentials = Depends(security)):
     if not basic_ok(credentials):
@@ -83,29 +83,20 @@ def execute(payload: dict, credentials: HTTPBasicCredentials = Depends(security)
 
 LOG_FILE = "audit_log.jsonl"
 
-def write_audit(entry: dict):
-    entry["timestamp"] = int(time.time())
-    with open(LOG_FILE, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+#def write_audit(entry: dict):
+#    entry["timestamp"] = int(time.time())
+#    with open(LOG_FILE, "a") as f:
+#        f.write(json.dumps(entry) + "\n")
 
 @app.post("/audit")
 def audit(event: dict, credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    write_audit(event)
-    return {"logged": True}
+    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
+    return auditor_agent.record(event, audit_tool)
 
 @app.get("/audit/logs")
-def get_audit(credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    logs = []
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE) as f:
-            for line in f:
-                logs.append(json.loads(line))
-    return {"logs": logs}
-
+def audit_logs(limit: int = 200, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
+    return auditor_agent.fetch(audit_tool, limit)
 
 rag = RAGTool()
 interview_agent = InterviewAgent()
