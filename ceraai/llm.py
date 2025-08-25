@@ -5,6 +5,7 @@ from openai import OpenAI
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+
 SYSTEM = (
     "You are CERAai Interview Agent. Goal: collect minimal fields to create a US Legal Entity. "
     "Ask ONE next-best question, concise, no chit-chat. If US and employees_in_CA=true, ensure CA EDD ID gets asked."
