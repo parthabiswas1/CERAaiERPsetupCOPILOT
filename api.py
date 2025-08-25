@@ -32,6 +32,8 @@ executor_agent  = ExecutorAgent()
 erp_connector   = ERPConnector()
 auditor_agent   = AuditorAgent()
 audit_tool      = AuditTool()
+mapper_agent    = MapperAgent()
+
 
 
 def init_db():
@@ -79,16 +81,17 @@ def secure_check(credentials: HTTPBasicCredentials = Depends(security)):
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 @app.post("/validate")
-def validate(payload: dict, credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return validator_agent.validate(payload, rules_tool)
+def validate(payload: dict, request: Request, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
+    res = validator_agent.validate(payload, rules_tool)
+    return {"run_id": request.state.run_id, **res}
 
 @app.post("/execute")
-def execute(payload: dict, credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return executor_agent.execute(payload, erp_connector)
+def execute(payload: dict, request: Request, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
+    res = executor_agent.execute(payload, erp_connector)
+    return {"run_id": request.state.run_id, **res}
+
 
 
 LOG_FILE = "audit_log.jsonl"
@@ -100,38 +103,25 @@ LOG_FILE = "audit_log.jsonl"
 
 @app.post("/audit")
 def audit(event: dict, request: Request, credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
     event = {**event, "run_id": request.state.run_id}
     return auditor_agent.record(event, audit_tool)
-
 
 @app.get("/audit/logs")
 def audit_logs(run_id: str | None = None, limit: int = 200,
                credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials): raise HTTPException(status_code=401)
+    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
     data = auditor_agent.fetch(audit_tool, limit)["logs"]
-    return {"logs": [e for e in data if not run_id or e.get("run_id")==run_id]}
+    return {"logs": [e for e in data if not run_id or e.get("run_id") == run_id]}
 
-
-rag = RAGTool()
-interview_agent = InterviewAgent()
-
-# replace (or add) the interview endpoint
 @app.get("/interview/next")
-def interview_next(credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+def interview_next(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
     out = interview_agent.next_question(state={}, rag=rag)
-    return out
-
-
-mapper_agent = MapperAgent()
+    return {"run_id": request.state.run_id, **out}
 
 @app.post("/map")
-def map_to_fusion(payload: dict, credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+def map_to_fusion(payload: dict, request: Request, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
     mapped = mapper_agent.map_to_fusion(payload)
-    return {"status": "ok", "mapped": mapped}
-
+    return {"run_id": request.state.run_id, "status": "ok", "mapped": mapped}
