@@ -4,6 +4,8 @@ from fastapi.responses import JSONResponse
 import sqlite3, os, hashlib, time
 from typing import Dict
 import json
+from ceraai.tools import RAGTool
+from ceraai.agents import InterviewAgent
 
 app = FastAPI(title="CERAai ERP Setup Copilot - MVP")
 security = HTTPBasic()
@@ -164,3 +166,14 @@ def get_audit(credentials: HTTPBasicCredentials = Depends(security)):
                 logs.append(json.loads(line))
     return {"logs": logs}
 
+
+rag = RAGTool()
+interview_agent = InterviewAgent()
+
+# replace (or add) the interview endpoint
+@app.get("/interview/next")
+def interview_next(credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    out = interview_agent.next_question(state={}, rag=rag)
+    return out
