@@ -15,6 +15,11 @@ app = FastAPI(title="CERAai ERP Setup Copilot - MVP")
 security = HTTPBasic()
 DB_PATH = os.getenv("DB_PATH", "rules.sqlite")  # default file name if DB_PATH is not set
 
+@app.on_event("startup")
+def boot():
+    init_db()  # make sure rules/runs/idem tables exist at process start
+
+
 @app.middleware("http")
 async def ensure_run_id(request: Request, call_next):
     rid = request.headers.get("x-run-id") or str(uuid4())
@@ -96,17 +101,29 @@ def init_db():
 def _conn(): return sqlite3.connect(DB_PATH)
 
 def load_state(run_id: str) -> dict:
-    con=_conn(); cur=con.cursor()
-    cur.execute("SELECT inputs,missing,mapped,result FROM runs WHERE run_id=?", (run_id,))
-    row=cur.fetchone(); con.close()
-    if not row: return {"inputs":{}, "missing":[], "mapped":None, "result":None}
-    (inputs, missing, mapped, result)=row
+    con = sqlite3.connect(DB_PATH); cur = con.cursor()
+    try:
+        cur.execute("SELECT inputs,missing,mapped,result FROM runs WHERE run_id=?", (run_id,))
+        row = cur.fetchone()
+    except sqlite3.OperationalError as e:
+        # table missing -> initialize once and return empty state
+        if "no such table" in str(e):
+            con.close()
+            init_db()
+            return {"inputs": {}, "missing": [], "mapped": None, "result": None}
+        con.close()
+        raise
+    con.close()
+    if not row:
+        return {"inputs": {}, "missing": [], "mapped": None, "result": None}
+    inputs, missing, mapped, result = row
     return {
         "inputs": json.loads(inputs or "{}"),
         "missing": json.loads(missing or "[]"),
         "mapped": json.loads(mapped or "null"),
         "result": json.loads(result or "null"),
     }
+
 
 def save_state(run_id: str, **patch):
     st = load_state(run_id)
