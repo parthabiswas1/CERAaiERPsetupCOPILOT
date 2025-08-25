@@ -1,6 +1,7 @@
 # ceraai/agents.py
 from typing import Dict, List
 from .tools import RAGTool, RulesTool, ERPConnector, AuditTool
+import hashlib, time
 
 class InterviewAgent:
     def next_question(self, state: Dict, rag: RAGTool) -> Dict:
@@ -20,9 +21,29 @@ class MapperAgent:
         return {"status": "stub"}
 
 class ExecutorAgent:
-    def execute(self, mapped: Dict, erp: ERPConnector) -> Dict:
-        # will delegate to /execute logic in next step
-        return {"status": "stub"}
+    def execute(self, payload: Dict, erp: ERPConnector) -> Dict:
+        # expect { "endpoint": "/legalEntities", "body": {...} }
+        endpoint = payload.get("endpoint", "/legalEntities")
+        body = payload.get("body", {}) or {}
+
+        # deterministic fake IDs based on legalName hash
+        legal_name = (body.get("legalName") or "DemoCo").encode()
+        seed = int(hashlib.sha256(legal_name).hexdigest()[:6], 16)
+        le_id = f"LE-{seed % 9000 + 1000}"
+
+        reg_ids = []
+        for idx, reg in enumerate(body.get("registrations", []), start=1):
+            rseed = int(hashlib.sha256(f"{legal_name}-{idx}".encode()).hexdigest()[:4], 16)
+            reg_ids.append({"type": reg.get("type"), "id": f"REG-{idx}-{rseed % 900 + 100}"})
+
+        return {
+            "executed_endpoint": endpoint,
+            "legalEntityId": le_id,
+            "registrations": reg_ids,
+            "status": "success",
+            "ts": int(time.time()),
+        }
+
 
 class AuditorAgent:
     def record(self, event: Dict, audit: AuditTool) -> None:
