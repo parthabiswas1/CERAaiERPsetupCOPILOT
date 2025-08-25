@@ -2,11 +2,19 @@
 from typing import Dict, List
 from .tools import RAGTool, RulesTool, ERPConnector, AuditTool
 import hashlib, time
+from . import llm
 
 class InterviewAgent:
     def next_question(self, state: Dict, rag: RAGTool) -> Dict:
-        hits = rag.retrieve("legal entity setup US")
-        return {"question": "What is the company’s country of registration?", "context": hits[:1]}
+        hits = rag.retrieve("US legal entity setup")
+        snippets = [h["snippet"] for h in hits]
+        # answers/state can be extended later; keep empty for MVP
+        try:
+            q = llm.next_best_question(snippets, state.get("inputs", {}))
+        except Exception:
+            q = "What is the company’s country of registration?"
+        return {"question": q, "context": hits[:2]}
+
 
 
 class ValidatorAgent:
