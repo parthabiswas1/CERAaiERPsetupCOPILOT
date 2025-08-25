@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import JSONResponse
 import sqlite3, os, hashlib, time
+from typing import Dict
 
 app = FastAPI(title="CERAai ERP Setup Copilot - MVP")
 security = HTTPBasic()
@@ -72,3 +73,40 @@ def validate(payload: dict, credentials: HTTPBasicCredentials = Depends(security
             missing.append({"field": field, "message": msg})
 
     return {"status": "ok" if not missing else "incomplete", "missing": missing}
+
+
+def build_fusion_payload(inputs: Dict) -> Dict:
+    legal_name = inputs.get("legal_name", "DemoCo")
+    country = (inputs.get("country") or "US").upper()
+    address = inputs.get("address") or {"line1":"123 Main St","city":"San Jose","state":"CA","postalCode":"95110","country":country}
+
+    registrations = []
+    if inputs.get("ein"):
+        registrations.append({"type": "EIN", "value": inputs["ein"]})
+    if inputs.get("ca_edd_id"):
+        registrations.append({"type": "CA_EDD", "value": inputs["ca_edd_id"]})
+
+    return {
+        "apiVersion": "v1",
+        "endpoint": "/legalEntities",
+        "body": {
+            "legalName": legal_name,
+            "legalAddress": address,
+            "country": country,
+            "registrations": registrations
+        },
+        "sequence": [
+            {"endpoint": "/legalAddresses", "method": "POST"},
+            {"endpoint": "/legalEntities", "method": "POST"},
+            {"endpoint": "/legalEntityRegistrations", "method": "POST"}
+        ],
+        "schemaVersion": "fusion-2024.1"
+    }
+
+@app.post("/map")
+def map_to_fusion(payload: dict, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    mapped = build_fusion_payload(payload)
+    return {"status": "ok", "mapped": mapped}
+
