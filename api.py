@@ -68,22 +68,8 @@ def secure_check(credentials: HTTPBasicCredentials = Depends(security)):
 def validate(payload: dict, credentials: HTTPBasicCredentials = Depends(security)):
     if not basic_ok(credentials):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    return validator_agent.validate(payload, rules_tool)
 
-    country = str(payload.get("country", "")).upper()
-    flags = {k:str(v).lower() for k,v in payload.items()}
-
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("SELECT country,condition_key,condition_value,field,mandatory,message FROM rules WHERE country=? OR country IS NULL", (country,))
-    rows = cur.fetchall(); con.close()
-
-    missing = []
-    for (_country, ckey, cval, field, mandatory, msg) in rows:
-        if ckey and str(flags.get(ckey, "false")) != str(cval):
-            continue  # condition not met
-        if mandatory and not payload.get(field):
-            missing.append({"field": field, "message": msg})
-
-    return {"status": "ok" if not missing else "incomplete", "missing": missing}
 
 
 def build_fusion_payload(inputs: Dict) -> Dict:
