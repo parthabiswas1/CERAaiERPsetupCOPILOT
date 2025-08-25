@@ -27,3 +27,41 @@ class ExecutorAgent:
 class AuditorAgent:
     def record(self, event: Dict, audit: AuditTool) -> None:
         audit.log(event)
+
+# ceraai/agents.py
+
+class MapperAgent:
+    def map_to_fusion(self, inputs: Dict) -> Dict:
+        legal_name = inputs.get("legal_name", "DemoCo")
+        country = (inputs.get("country") or "US").upper()
+        address = inputs.get("address") or {
+            "line1": "123 Main St",
+            "city": "San Jose",
+            "state": "CA",
+            "postalCode": "95110",
+            "country": country,
+        }
+
+        registrations = []
+        if inputs.get("ein"):
+            registrations.append({"type": "EIN", "value": inputs["ein"]})
+        if inputs.get("ca_edd_id"):
+            registrations.append({"type": "CA_EDD", "value": inputs["ca_edd_id"]})
+
+        return {
+            "apiVersion": "v1",
+            "endpoint": "/legalEntities",
+            "body": {
+                "legalName": legal_name,
+                "legalAddress": address,
+                "country": country,
+                "registrations": registrations,
+            },
+            "sequence": [
+                {"endpoint": "/legalAddresses", "method": "POST"},
+                {"endpoint": "/legalEntities", "method": "POST"},
+                {"endpoint": "/legalEntityRegistrations", "method": "POST"},
+            ],
+            "schemaVersion": "fusion-2024.1",
+        }
+
