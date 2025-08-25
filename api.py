@@ -4,10 +4,9 @@ from fastapi.responses import JSONResponse
 import sqlite3, os, hashlib, time
 from typing import Dict
 import json
-from ceraai.tools import RAGTool
-from ceraai.agents import InterviewAgent
 from ceraai.tools import RAGTool, RulesTool
-from ceraai.agents import InterviewAgent, ValidatorAgent
+from ceraai.agents import InterviewAgent, ValidatorAgent, MapperAgent
+import random
 
 
 app = FastAPI(title="CERAai ERP Setup Copilot - MVP")
@@ -72,42 +71,6 @@ def validate(payload: dict, credentials: HTTPBasicCredentials = Depends(security
 
 
 
-def build_fusion_payload(inputs: Dict) -> Dict:
-    legal_name = inputs.get("legal_name", "DemoCo")
-    country = (inputs.get("country") or "US").upper()
-    address = inputs.get("address") or {"line1":"123 Main St","city":"San Jose","state":"CA","postalCode":"95110","country":country}
-
-    registrations = []
-    if inputs.get("ein"):
-        registrations.append({"type": "EIN", "value": inputs["ein"]})
-    if inputs.get("ca_edd_id"):
-        registrations.append({"type": "CA_EDD", "value": inputs["ca_edd_id"]})
-
-    return {
-        "apiVersion": "v1",
-        "endpoint": "/legalEntities",
-        "body": {
-            "legalName": legal_name,
-            "legalAddress": address,
-            "country": country,
-            "registrations": registrations
-        },
-        "sequence": [
-            {"endpoint": "/legalAddresses", "method": "POST"},
-            {"endpoint": "/legalEntities", "method": "POST"},
-            {"endpoint": "/legalEntityRegistrations", "method": "POST"}
-        ],
-        "schemaVersion": "fusion-2024.1"
-    }
-
-@app.post("/map")
-def map_to_fusion(payload: dict, credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    mapped = build_fusion_payload(payload)
-    return {"status": "ok", "mapped": mapped}
-
-import random
 
 @app.post("/execute")
 def execute(payload: dict, credentials: HTTPBasicCredentials = Depends(security)):
@@ -171,3 +134,15 @@ def interview_next(credentials: HTTPBasicCredentials = Depends(security)):
         raise HTTPException(status_code=401, detail="Unauthorized")
     out = interview_agent.next_question(state={}, rag=rag)
     return out
+
+
+
+mapper_agent = MapperAgent()
+
+@app.post("/map")
+def map_to_fusion(payload: dict, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    mapped = mapper_agent.map_to_fusion(payload)
+    return {"status": "ok", "mapped": mapped}
+
