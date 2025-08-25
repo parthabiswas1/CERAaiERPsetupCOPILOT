@@ -126,7 +126,6 @@ def interview_next(credentials: HTTPBasicCredentials = Depends(security)):
     return out
 
 
-
 mapper_agent = MapperAgent()
 
 @app.post("/map")
