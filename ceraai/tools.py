@@ -1,7 +1,8 @@
 # ceraai/tools.py
 from typing import Dict, List
-import json, os, re
+import json, os, re, time
 import sqlite3
+
 
 PACK_PATH = os.path.join("knowledge", "pack_us_tech.json")
 
@@ -54,6 +55,20 @@ class ERPConnector:
     def create_legal_entity(self, payload: Dict) -> Dict:
         return {"id": "LE-1001"}
 
+
 class AuditTool:
+    def __init__(self, path: str = os.environ.get("AUDIT_FILE", "audit_log.jsonl")):
+        self.path = path
+
     def log(self, entry: Dict) -> None:
-        pass
+        entry = dict(entry)
+        entry["timestamp"] = int(time.time())
+        with open(self.path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    def read(self, limit: int = 200) -> List[Dict]:
+        if not os.path.exists(self.path):
+            return []
+        with open(self.path) as f:
+            lines = f.readlines()[-limit:]
+        return [json.loads(x) for x in lines]
