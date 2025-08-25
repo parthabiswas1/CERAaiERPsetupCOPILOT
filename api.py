@@ -8,12 +8,22 @@ from typing import Dict
 from ceraai.tools import RAGTool, RulesTool, ERPConnector, AuditTool
 from ceraai.agents import InterviewAgent, ValidatorAgent, MapperAgent, ExecutorAgent, AuditorAgent
 import random
+from fastapi.middleware.cors import CORSMiddleware
 
-
+DB_PATH = os.getenv("DB_PATH", "rules.sqlite")  # default file name if DB_PATH is not set
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # set to your UI origin later
 
 app = FastAPI(title="CERAai ERP Setup Copilot - MVP")
 security = HTTPBasic()
-DB_PATH = os.getenv("DB_PATH", "rules.sqlite")  # default file name if DB_PATH is not set
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[FRONTEND_ORIGIN],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.on_event("startup")
 def boot():
