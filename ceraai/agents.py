@@ -7,10 +7,12 @@ class InterviewAgent:
         hits = rag.retrieve("legal entity setup US")
         return {"question": "What is the company’s country of registration?", "context": hits[:1]}
 
+
 class ValidatorAgent:
     def validate(self, payload: Dict, rules: RulesTool) -> Dict:
-        # will delegate to existing /validate logic in next step
-        return {"status": "stub"}
+        missing = rules.compute_missing(payload)
+        return {"status": "ok" if not missing else "incomplete", "missing": missing}
+
 
 class MapperAgent:
     def map_to_fusion(self, inputs: Dict) -> Dict:
