@@ -16,7 +16,6 @@ class InterviewAgent:
         return {"question": q, "context": hits[:2]}
 
 
-
 class ValidatorAgent:
     def validate(self, payload: Dict, rules: RulesTool) -> Dict:
         missing = rules.compute_missing(payload)
