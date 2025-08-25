@@ -1,6 +1,8 @@
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import JSONResponse
+from fastapi import Request
+from uuid import uuid4
 import sqlite3, os, hashlib, time
 from typing import Dict
 import json
@@ -11,8 +13,16 @@ import random
 
 app = FastAPI(title="CERAai ERP Setup Copilot - MVP")
 security = HTTPBasic()
-
 DB_PATH = "rules.sqlite"
+
+@app.middleware("http")
+async def ensure_run_id(request: Request, call_next):
+    rid = request.headers.get("x-run-id") or str(uuid4())
+    request.state.run_id = rid
+    resp = await call_next(request)
+    resp.headers["X-Run-ID"] = rid
+    return resp
+
 
 rag = RAGTool()
 rules_tool = RulesTool()
@@ -89,14 +99,20 @@ LOG_FILE = "audit_log.jsonl"
 #        f.write(json.dumps(entry) + "\n")
 
 @app.post("/audit")
-def audit(event: dict, credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
+def audit(event: dict, request: Request, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    event = {**event, "run_id": request.state.run_id}
     return auditor_agent.record(event, audit_tool)
 
+
 @app.get("/audit/logs")
-def audit_logs(limit: int = 200, credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
-    return auditor_agent.fetch(audit_tool, limit)
+def audit_logs(run_id: str | None = None, limit: int = 200,
+               credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials): raise HTTPException(status_code=401)
+    data = auditor_agent.fetch(audit_tool, limit)["logs"]
+    return {"logs": [e for e in data if not run_id or e.get("run_id")==run_id]}
+
 
 rag = RAGTool()
 interview_agent = InterviewAgent()
