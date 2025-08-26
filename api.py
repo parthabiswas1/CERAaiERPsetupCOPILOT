@@ -139,24 +139,50 @@ GATING_ORDER = ["country","employ_in_country","sells_in_country","has_tax_id","r
 
 def get_country_pack(ctry: str | None):
     c = (ctry or "US").upper()
-    # 1) try DB
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("SELECT json FROM country_packs WHERE country=?", (c,))
-    row = cur.fetchone()
-    con.close()
-    if row:
-        return json.loads(row[0])
 
-    # 2) generate via RAG, persist, return
-    pack = rag.generate_pack(c)
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("""INSERT INTO country_packs(country,json,version,updated_at)
-                   VALUES(?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-                   ON CONFLICT(country) DO UPDATE SET json=excluded.json,
-                       version=excluded.version, updated_at=excluded.updated_at""",
-                (c, json.dumps(pack), "rag-derivative"))
-    con.commit(); con.close()
-    return pack
+    # Try DB-backed pack first
+    try:
+        con = sqlite3.connect(DB_PATH); cur = con.cursor()
+        cur.execute("SELECT json FROM country_packs WHERE country=?", (c,))
+        row = cur.fetchone()
+        con.close()
+        if row and row[0]:
+            pack = json.loads(row[0])
+            # Ensure required keys exist
+            pack.setdefault("country", c)
+            pack.setdefault("base_fields", [])
+            pack.setdefault("gating", [])
+            pack.setdefault("field_hints", {})
+            return pack
+    except Exception:
+        pass
+
+    # Fallback defaults
+    if c == "US":
+        return {
+            "country": "US",
+            "base_fields": ["legal_name","country","address_line1","city","state_region","postal_code","ein"],
+            "gating": [
+                {"key":"employ_in_country","type":"bool","on_true_add":["employer_registration_id"]},
+                {"key":"sells_in_country","type":"bool","on_true_add":["indirect_tax_id"]},
+                {"key":"has_tax_id","type":"bool"},
+                {"key":"regulatory_category","type":"enum","options":["none","npo","gov","fsi"],"map":{"fsi":["regulator_code"]}}
+            ],
+            "field_hints": {"ein":"Format NN-NNNNNNN.","indirect_tax_id":"Sales/VAT permit if selling."}
+        }
+    # Generic non-US fallback
+    return {
+        "country": c,
+        "base_fields": ["legal_name","country","address_line1","city","state_region","postal_code","tax_id"],
+        "gating": [
+            {"key":"employ_in_country","type":"bool"},
+            {"key":"sells_in_country","type":"bool"},
+            {"key":"has_tax_id","type":"bool"},
+            {"key":"regulatory_category","type":"enum","options":["none","npo","gov","fsi"]}
+        ],
+        "field_hints": {}
+    }
+
 
 
 def normalize_country(text: str) -> str | None:
