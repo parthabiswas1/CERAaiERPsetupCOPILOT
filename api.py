@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from io import BytesIO
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill
-
+from datetime import datetime
 
 
 DB_PATH = os.getenv("DB_PATH", str(pathlib.Path("/tmp/ceraai.db")))
@@ -69,31 +69,25 @@ def _run_dir(run_id: str) -> pathlib.Path:
 
 def init_db():
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    # Create table (new installs)
+    # base table (old installs won’t have new columns)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS runs (
       run_id TEXT PRIMARY KEY,
       inputs TEXT DEFAULT '{}',
       missing TEXT DEFAULT '[]',
       mapped TEXT,
-      result TEXT,
-      gating TEXT DEFAULT '{}',
-      phase TEXT DEFAULT 'gating',
-      required_fields TEXT,
-      current_ask_for TEXT,
-      created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+      result TEXT
     )""")
-    # Add columns if migrating from old schema
+    # migrate: add new columns if missing
     def _add(col, ddl):
-        try:
-            cur.execute(f"ALTER TABLE runs ADD COLUMN {col} {ddl}")
-        except Exception:
-            pass
+        try: cur.execute(f"ALTER TABLE runs ADD COLUMN {col} {ddl}")
+        except sqlite3.OperationalError: pass
     _add("gating", "TEXT DEFAULT '{}'")
     _add("phase", "TEXT DEFAULT 'gating'")
     _add("required_fields", "TEXT")
     _add("current_ask_for", "TEXT")
     _add("created_at", "TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
+    _add("updated_at", "TEXT")
     con.commit(); con.close()
 
 def _jdump(x):
@@ -109,61 +103,53 @@ def load_state(run_id: str) -> dict:
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
     cur.execute("""SELECT inputs, missing, mapped, result, gating, phase, required_fields, current_ask_for
                    FROM runs WHERE run_id=?""", (run_id,))
-    row = cur.fetchone()
-    con.close()
+    row = cur.fetchone(); con.close()
     if not row:
-        # initialize empty state
         return {
             "run_id": run_id,
-            "inputs": {},
-            "missing": [],
-            "mapped": None,
-            "result": None,
-            "gating": {},
-            "phase": "gating",
-            "required_fields": None,
-            "current_ask_for": None,
+            "inputs": {}, "missing": [], "mapped": None, "result": None,
+            "gating": {}, "phase": "gating", "required_fields": None, "current_ask_for": None,
         }
     inputs, missing, mapped, result, gating, phase, required_fields, current_ask_for = row
     return {
         "run_id": run_id,
-        "inputs": _jload(inputs, {}),
-        "missing": _jload(missing, []),
-        "mapped": _jload(mapped, None),
-        "result": _jload(result, None),
-        "gating": _jload(gating, {}),
-        "phase": phase or "gating",
-        "required_fields": _jload(required_fields, None),
-        "current_ask_for": current_ask_for,
+        "inputs": _jload(inputs, {}), "missing": _jload(missing, []),
+        "mapped": _jload(mapped, None), "result": _jload(result, None),
+        "gating": _jload(gating, {}), "phase": phase or "gating",
+        "required_fields": _jload(required_fields, None), "current_ask_for": current_ask_for,
     }
 
 def save_state(run_id: str, **st):
-    # ensure row exists
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("INSERT OR IGNORE INTO runs (run_id, inputs, missing) VALUES (?, '{}', '[]')", (run_id,))
-    cur.execute("""UPDATE runs SET
-        inputs=?,
-        missing=?,
-        mapped=?,
-        result=?,
-        gating=?,
-        phase=?,
-        required_fields=?,
-        current_ask_for=?
-        WHERE run_id=?""",
-        (
-            _jdump(st.get("inputs", {})),
-            _jdump(st.get("missing", [])),
-            _jdump(st.get("mapped", None)),
-            _jdump(st.get("result", None)),
-            _jdump(st.get("gating", {})),
-            st.get("phase", "gating"),
-            _jdump(st.get("required_fields", None)),
-            st.get("current_ask_for"),
-            run_id,
-        )
-    )
+    # ensure row exists
+    cur.execute("INSERT OR IGNORE INTO runs (run_id) VALUES (?)", (run_id,))
+
+    # discover existing columns, build UPDATE accordingly
+    cols_info = cur.execute("PRAGMA table_info(runs)").fetchall()
+    existing = {c[1] for c in cols_info}
+
+    values_map = {
+        "inputs": _jdump(st.get("inputs", {})),
+        "missing": _jdump(st.get("missing", [])),
+        "mapped": _jdump(st.get("mapped", None)),
+        "result": _jdump(st.get("result", None)),
+        "gating": _jdump(st.get("gating", {})),
+        "phase": st.get("phase", "gating"),
+        "required_fields": _jdump(st.get("required_fields", None)),
+        "current_ask_for": st.get("current_ask_for"),
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+    set_cols, set_vals = [], []
+    for col, val in values_map.items():
+        if col in existing:
+            set_cols.append(f"{col}=?")
+            set_vals.append(val)
+    set_vals.append(run_id)
+
+    cur.execute(f"UPDATE runs SET {', '.join(set_cols)} WHERE run_id=?", set_vals)
     con.commit(); con.close()
+
 
 
 def _conn(): return sqlite3.connect(DB_PATH)
