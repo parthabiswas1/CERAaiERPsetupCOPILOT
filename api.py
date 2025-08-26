@@ -9,7 +9,6 @@ from openpyxl.styles import PatternFill
 from datetime import datetime
 from typing import Any
 import os, sqlite3, json, pathlib
-
 from ceraai.tools import RulesTool, ERPConnector, AuditTool
 from ceraai.agents import InterviewAgent, ValidatorAgent, MapperAgent, ExecutorAgent, AuditorAgent
 from ceraai.rag import RAGTool
