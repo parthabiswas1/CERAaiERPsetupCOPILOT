@@ -436,7 +436,11 @@ def interview_next(request: Request, credentials: HTTPBasicCredentials = Depends
 
 
 @app.post("/interview/answer")
-def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCredentials = Depends(security)):
+def interview_answer(
+    payload: dict,
+    request: Request,
+    credentials: HTTPBasicCredentials = Depends(security),
+):
     if not basic_ok(credentials):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -444,27 +448,38 @@ def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCred
     text = str(payload.get("text", "")).strip()
     st = load_state(run_id)
 
-    # Ensure gating dicts exist
+    # Ensure dicts exist
     if "gating" not in st:
         st["gating"] = {}
     if "inputs" not in st:
         st["inputs"] = {}
 
+    # Figure out current pack
     ctry = st["gating"].get("country") or st["inputs"].get("country")
     pack = get_country_pack(ctry)
 
+    # What is the current gating key we’re expecting?
     ask_for = st.get("ask_for") or next_gating_key(st, pack)
     if not ask_for:
-        return {"run_id": run_id, "phase": "gating", "accepted": False, "message": "No gating question pending."}
+        return {
+            "run_id": run_id,
+            "phase": "gating",
+            "accepted": False,
+            "message": "No gating question pending.",
+        }
 
+    # Validate this answer
     ok, res = validate_gating_answer(ask_for, text, pack)
 
     if ok:
-        # Persist answer
+        # Persist this answer
         st["gating"].update(res)
         st["inputs"].update(res)
 
-        # Find the next gating key
+        # Mark that we’ve finished this question
+        st["ask_for"] = None
+
+        # Check for next gating key
         next_key = next_gating_key(st, pack)
         if next_key:
             st["ask_for"] = next_key
@@ -482,8 +497,10 @@ def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCred
                 },
             }
         else:
+            # All gating complete → record required fields
+            required = derive_required_fields(pack, st["gating"])
             st["complete"] = True
-            st["ask_for"] = None
+            st["required_fields"] = required
             save_state(run_id, **st)
             return {
                 "run_id": run_id,
@@ -494,11 +511,12 @@ def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCred
             }
 
     else:
-        # Validation failed
+        # Validation failed → stay on same question
         return {
             "run_id": run_id,
             "phase": "gating",
             "accepted": False,
+            "ask_for": ask_for,
             "message": res,
         }
 
