@@ -66,10 +66,9 @@ def _run_dir(run_id: str) -> pathlib.Path:
 
 # --- state persistence---
 
-
 def init_db():
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    # base table (old installs won’t have new columns)
+    # Base table (older deployments may not have new cols)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS runs (
       run_id TEXT PRIMARY KEY,
@@ -78,10 +77,11 @@ def init_db():
       mapped TEXT,
       result TEXT
     )""")
-    # migrate: add new columns if missing
+    # Migrations: add columns if missing
     def _add(col, ddl):
         try: cur.execute(f"ALTER TABLE runs ADD COLUMN {col} {ddl}")
-        except sqlite3.OperationalError: pass
+        except sqlite3.OperationalError:
+            pass
     _add("gating", "TEXT DEFAULT '{}'")
     _add("phase", "TEXT DEFAULT 'gating'")
     _add("required_fields", "TEXT")
@@ -108,23 +108,26 @@ def load_state(run_id: str) -> dict:
         return {
             "run_id": run_id,
             "inputs": {}, "missing": [], "mapped": None, "result": None,
-            "gating": {}, "phase": "gating", "required_fields": None, "current_ask_for": None,
+            "gating": {}, "phase": "gating", "required_fields": None,
+            "current_ask_for": None, "complete": False,
         }
     inputs, missing, mapped, result, gating, phase, required_fields, current_ask_for = row
     return {
         "run_id": run_id,
         "inputs": _jload(inputs, {}), "missing": _jload(missing, []),
         "mapped": _jload(mapped, None), "result": _jload(result, None),
-        "gating": _jload(gating, {}), "phase": phase or "gating",
-        "required_fields": _jload(required_fields, None), "current_ask_for": current_ask_for,
+        "gating": _jload(gating, {}), "phase": (phase or "gating"),
+        "required_fields": _jload(required_fields, None),
+        "current_ask_for": current_ask_for,
+        "complete": False,
     }
 
 def save_state(run_id: str, **st):
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    # ensure row exists
+    # Ensure row exists
     cur.execute("INSERT OR IGNORE INTO runs (run_id) VALUES (?)", (run_id,))
 
-    # discover existing columns, build UPDATE accordingly
+    # Discover existing columns
     cols_info = cur.execute("PRAGMA table_info(runs)").fetchall()
     existing = {c[1] for c in cols_info}
 
@@ -149,63 +152,6 @@ def save_state(run_id: str, **st):
 
     cur.execute(f"UPDATE runs SET {', '.join(set_cols)} WHERE run_id=?", set_vals)
     con.commit(); con.close()
-
-
-
-def _conn(): return sqlite3.connect(DB_PATH)
-
-def load_state(run_id: str) -> dict:
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    try:
-        cur.execute("SELECT inputs,missing,mapped,result FROM runs WHERE run_id=?", (run_id,))
-        row = cur.fetchone()
-    except sqlite3.OperationalError as e:
-        # table missing -> initialize once and return empty state
-        if "no such table" in str(e):
-            con.close()
-            init_db()
-            return {"inputs": {}, "missing": [], "mapped": None, "result": None}
-        con.close()
-        raise
-    con.close()
-    if not row:
-        return {"inputs": {}, "missing": [], "mapped": None, "result": None}
-    inputs, missing, mapped, result = row
-    return {
-        "inputs": json.loads(inputs or "{}"),
-        "missing": json.loads(missing or "[]"),
-        "mapped": json.loads(mapped or "null"),
-        "result": json.loads(result or "null"),
-    }
-
-
-def save_state(run_id: str, **patch):
-    st = load_state(run_id)
-    st.update(patch)
-    con=_conn(); cur=con.cursor()
-    cur.execute("""INSERT INTO runs(run_id,inputs,missing,mapped,result,updated_at)
-                   VALUES(?,?,?,?,?,?)
-                   ON CONFLICT(run_id) DO UPDATE SET
-                     inputs=excluded.inputs, missing=excluded.missing,
-                     mapped=excluded.mapped, result=excluded.result,
-                     updated_at=excluded.updated_at""",
-        (run_id,
-         json.dumps(st["inputs"]), json.dumps(st["missing"]),
-         json.dumps(st["mapped"]), json.dumps(st["result"]), int(time.time())))
-    con.commit(); con.close()
-
-def idem_get(action: str, key: str):
-    con=_conn(); cur=con.cursor()
-    cur.execute("SELECT resp FROM idem WHERE action=? AND key=?", (action,key))
-    row=cur.fetchone(); con.close()
-    return json.loads(row[0]) if row else None
-
-def idem_put(action: str, key: str, resp: dict):
-    con=_conn(); cur=con.cursor()
-    cur.execute("INSERT OR REPLACE INTO idem(action,key,resp) VALUES(?,?,?)",
-                (action,key,json.dumps(resp)))
-    con.commit(); con.close()
-
 
 
 def basic_ok(creds: HTTPBasicCredentials):
@@ -397,6 +343,7 @@ def audit_logs(run_id: str | None = None, limit: int = 200,
     data = auditor_agent.fetch(audit_tool, limit)["logs"]
     return {"logs": [e for e in data if not run_id or e.get("run_id") == run_id]}
 
+
 @app.get("/interview/next")
 def interview_next(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
     if not basic_ok(credentials):
@@ -404,12 +351,12 @@ def interview_next(request: Request, credentials: HTTPBasicCredentials = Depends
 
     run_id = request.state.run_id
     st = load_state(run_id)
-    st.setdefault("gating", {})
-    st.setdefault("inputs", {})
+    st.setdefault("gating", {}); st.setdefault("inputs", {})
 
     ctry = st["gating"].get("country") or st["inputs"].get("country")
     pack = get_country_pack(ctry)
 
+    # Re-ask pending key if exists; else compute next
     ask_for = st.get("current_ask_for") or next_gating_key(st, pack)
     if not ask_for:
         st["complete"] = True
@@ -419,8 +366,13 @@ def interview_next(request: Request, credentials: HTTPBasicCredentials = Depends
 
     st["current_ask_for"] = ask_for
     save_state(run_id, **st)
-    return {"run_id": run_id, "phase": "gating", "ask_for": ask_for,
-            "complete": False, "question": gating_question(ask_for, pack)}
+    return {
+        "run_id": run_id,
+        "phase": "gating",
+        "ask_for": ask_for,
+        "complete": False,
+        "question": gating_question(ask_for, pack),
+    }
 
 
 @app.post("/interview/answer")
@@ -431,12 +383,12 @@ def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCred
     run_id = request.state.run_id
     text = str(payload.get("text", "")).strip()
     st = load_state(run_id)
-    st.setdefault("gating", {})
-    st.setdefault("inputs", {})
+    st.setdefault("gating", {}); st.setdefault("inputs", {})
 
     ctry = st["gating"].get("country") or st["inputs"].get("country")
     pack = get_country_pack(ctry)
 
+    # LOCK to pending key; only compute if missing
     ask_for = st.get("current_ask_for")
     if not ask_for:
         ask_for = next_gating_key(st, pack)
@@ -448,28 +400,49 @@ def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCred
 
     ok, res = validate_gating_answer(ask_for, text, pack)
     if not ok:
-        return {"run_id": run_id, "phase": "gating", "accepted": False,
-                "ask_for": ask_for, "message": res}
+        # stay on the same key
+        return {
+            "run_id": run_id,
+            "phase": "gating",
+            "accepted": False,
+            "ask_for": ask_for,
+            "message": res,
+        }
 
-    # persist answer
+    # Persist answer
     st["gating"].update(res)
     st["inputs"].update(res)
-    st["current_ask_for"] = None  # clear current key
 
+    # Advance to next key
     next_key = next_gating_key(st, pack)
     if next_key:
         st["current_ask_for"] = next_key
         save_state(run_id, **st)
-        return {"run_id": run_id, "phase": "gating", "accepted": True,
-                "next": {"run_id": run_id, "phase": "gating", "ask_for": next_key,
-                         "complete": False, "question": gating_question(next_key, pack)}}
+        return {
+            "run_id": run_id,
+            "phase": "gating",
+            "accepted": True,
+            "next": {
+                "run_id": run_id,
+                "phase": "gating",
+                "ask_for": next_key,
+                "complete": False,
+                "question": gating_question(next_key, pack),
+            },
+        }
 
-    # done
+    # Done: derive required fields and clear pending key
+    st["current_ask_for"] = None
     st["complete"] = True
     st["required_fields"] = derive_required_fields(pack, st["gating"])
     save_state(run_id, **st)
-    return {"run_id": run_id, "phase": "gating", "accepted": True,
-            "complete": True, "message": "Gating questions complete. You may now download the template."}
+    return {
+        "run_id": run_id,
+        "phase": "gating",
+        "accepted": True,
+        "complete": True,
+        "message": "Gating questions complete. You may now download the template.",
+    }
 
 
 
