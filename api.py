@@ -145,7 +145,7 @@ def load_state(run_id: str) -> dict:
     return base
 
 def save_state(run_id: str, **st):
-    # Avoid arg collision when callers pass st containing 'run_id'
+    # Defensive: callers often pass st that already includes 'run_id'
     st = dict(st)
     st.pop("run_id", None)
 
