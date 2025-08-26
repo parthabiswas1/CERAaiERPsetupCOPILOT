@@ -179,6 +179,22 @@ def idem_put(action: str, key: str, resp: dict):
 def basic_ok(creds: HTTPBasicCredentials):
     return creds.username == os.getenv("DEMO_USER", "demo") and creds.password == os.getenv("DEMO_PASS", "demo")
 
+def satisfied(inputs: dict) -> bool:
+    ctry = (inputs.get("country") or "").upper()
+    if ctry == "US":
+        base = all(inputs.get(k) for k in
+                   ["legal_name","country","address_line1","city","state_region","postal_code","ein"])
+        if not base: return False
+        if str(inputs.get("employees_in_CA")).lower() == "true":
+            return bool(inputs.get("ca_edd_id"))
+        return True
+    # Non-US: minimal example
+    return all(inputs.get(k) for k in
+               ["legal_name","country","address_line1","city","state_region","postal_code","tax_id"])
+
+
+
+
 @app.get("/")
 def root():
     return {"service": "CERAaiERPsetupCOPILOT", "status": "ok"}
@@ -251,40 +267,52 @@ def audit_logs(run_id: str | None = None, limit: int = 200,
 def interview_next(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
     if not basic_ok(credentials): raise HTTPException(status_code=401)
     st = load_state(request.state.run_id)
-    # compute current missing to steer the question
     res = validator_agent.validate(st["inputs"], rules_tool)
     st["missing"] = res["missing"]; save_state(request.state.run_id, **st)
 
-    # pick first missing field name (if any) to focus the LLM
-    want = st["missing"][0]["field"] if st["missing"] else None
-    hits = rag.retrieve("US legal entity setup")
+    if satisfied(st["inputs"]):
+        return {"run_id": request.state.run_id, "complete": True,
+                "question": "I have enough to generate your Legal Entity template. Download it when ready.",
+                "context": rag.retrieve("Oracle Fusion Legal Entity sequence")[:2]}
+
+    ask_for = st["missing"][0]["field"] if st["missing"] else "confirmation"
+    hits = rag.retrieve(f"Legal Entity field {ask_for} US")
     try:
         from ceraai import llm
-        prompt = f"Ask one concise question to collect field: {want}" if want else "Ask one final confirmation question before mapping/executing."
-        q = llm.next_best_question([h["snippet"] for h in hits], {"needed": want} if want else {})
+        q = llm.next_best_question([h["snippet"] for h in hits], {"needed": ask_for})
     except Exception:
-        q = f"Please provide {want}." if want else "Ready to proceed to mapping and execution?"
-    return {"run_id": request.state.run_id, "question": q, "context": hits[:2], "missing": st["missing"]}
+        q = f"Please provide {ask_for}."
+    return {"run_id": request.state.run_id, "complete": False, "ask_for": ask_for, "question": q, "context": hits[:2]}
+
 
 
 @app.post("/interview/answer")
 def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCredentials = Depends(security)):
     if not basic_ok(credentials): raise HTTPException(status_code=401)
+    text = (payload or {}).get("text", "").strip()
+    if not text: raise HTTPException(status_code=400, detail="Provide 'text' with your answer.")
+
     st = load_state(request.state.run_id)
+    hits = rag.retrieve("Oracle Fusion Legal Entity requirements US")
+    from ceraai import llm
+    extracted = llm.extract_fields(text, st["inputs"].get("country"), [h["snippet"] for h in hits])
 
-    # accept either {"answers": {...}} or {"field": "...", "value": "..."}
-    answers = payload.get("answers") or {}
-    if "field" in payload and "value" in payload:
-        answers[payload["field"]] = payload["value"]
-
-    st["inputs"].update(answers)
-
-    # re-validate after update
+    # merge & validate
+    st["inputs"].update(extracted or {})
     res = validator_agent.validate(st["inputs"], rules_tool)
     st["missing"] = res["missing"]
-    save_state(request.state.run_id, **st)
+    is_ready = satisfied(st["inputs"])
 
-    return {"run_id": request.state.run_id, "status": res["status"], "missing": res["missing"], "inputs": st["inputs"]}
+    save_state(request.state.run_id, **st)
+    return {
+        "run_id": request.state.run_id,
+        "status": "ready" if is_ready else ("ok" if res["status"]=="ok" else "incomplete"),
+        "extracted": extracted,
+        "missing": st["missing"],
+        "next_hint": (st["missing"][0]["field"] if st["missing"] else None),
+        "complete": is_ready
+    }
+
 
 
 @app.post("/map")
