@@ -193,6 +193,74 @@ def satisfied(inputs: dict) -> bool:
                ["legal_name","country","address_line1","city","state_region","postal_code","tax_id"])
 
 
+GATING_ORDER = ["country","employ_in_country","sells_in_country","has_tax_id","regulatory_category"]
+
+def get_country_pack(ctry: str | None):
+    # TODO: fetch from Pinecone via RAGTool; fallback to US
+    return {
+      "country": (ctry or "US").upper(),
+      "base_fields": ["legal_name","country","address_line1","city","state_region","postal_code","ein"],
+      "gating": [
+        {"key":"employ_in_country","type":"bool","on_true_add":["employer_registration_id"]},
+        {"key":"sells_in_country","type":"bool","on_true_add":["indirect_tax_id"]},
+        {"key":"has_tax_id","type":"bool"},
+        {"key":"regulatory_category","type":"enum","options":["none","npo","gov","fsi"],"map":{"fsi":["regulator_code"]}}
+      ],
+      "field_hints": {"ein":"Format NN-NNNNNNN.","indirect_tax_id":"Sales/VAT permit if selling."}
+    }
+
+def normalize_country(text:str)->str|None:
+    t=text.strip().lower()
+    if t in {"us","usa","united states","united states of america"}: return "US"
+    return t.upper() if len(t)==2 else None
+
+def parse_bool(text:str)->bool|None:
+    t=text.strip().lower()
+    if t in {"true","yes","y"}: return True
+    if t in {"false","no","n"}: return False
+    return None
+
+def validate_gating_answer(key:str, text:str, pack:dict):
+    if key=="country":
+        c=normalize_country(text); return (True, {"country":c}) if c else (False,"Provide a valid 2-letter ISO code (e.g., US).")
+    if key in {"employ_in_country","sells_in_country","has_tax_id"}:
+        b=parse_bool(text); return (True,{key:b}) if b is not None else (False,"Reply exactly: true or false.")
+    if key=="regulatory_category":
+        opts=set(pack.get("gating",[])[3]["options"]) if pack.get("gating") else set()
+        v=text.strip().lower()
+        return (True, {key:v}) if (not opts or v in opts) else (False, f"Choose one of: {', '.join(opts)}.")
+    return (False, "Unsupported gating key.")
+
+def next_gating_key(st, pack):
+    g = st.get("gating", {})
+    for k in GATING_ORDER:
+        if g.get(k) in (None, ""):
+            return k
+    return None
+
+def gating_question(key:str, pack:dict)->str:
+    # Prefer RAG phrasing; fallback:
+    fallback = {
+      "country": "Which country is this legal entity in? Reply with the 2-letter ISO code (e.g., US).",
+      "employ_in_country": "Will this entity employ staff in this country at go-live? Reply true or false.",
+      "sells_in_country": "Will this entity sell goods/services in this country? Reply true or false.",
+      "has_tax_id": "Do you already have a national tax ID for this entity? Reply true or false.",
+      "regulatory_category": "Regulatory category? Reply one of: none, npo, gov, fsi."
+    }
+    return fallback.get(key, f"Provide value for {key}.")
+
+def derive_required_fields(pack:dict, gating:dict)->list[str]:
+    req = list(pack["base_fields"])
+    for g in pack["gating"]:
+        k = g["key"]; v = gating.get(k)
+        if v is True and "on_true_add" in g:
+            req += g["on_true_add"]
+        if v and isinstance(v,str) and g.get("type")=="enum":
+            extra = (g.get("map") or {}).get(v, [])
+            req += extra
+    # de-dup
+    return list(dict.fromkeys(req))
+
 
 
 @app.get("/")
@@ -267,51 +335,91 @@ def audit_logs(run_id: str | None = None, limit: int = 200,
 def interview_next(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
     if not basic_ok(credentials): raise HTTPException(status_code=401)
     st = load_state(request.state.run_id)
-    res = validator_agent.validate(st["inputs"], rules_tool)
-    st["missing"] = res["missing"]; save_state(request.state.run_id, **st)
+    st.setdefault("phase","gating")
+    st.setdefault("gating",{})
+    pack = get_country_pack(st["gating"].get("country") or st["inputs"].get("country"))
 
-    if satisfied(st["inputs"]):
-        return {"run_id": request.state.run_id, "complete": True,
-                "question": "I have enough to generate your Legal Entity template. Download it when ready.",
-                "context": rag.retrieve("Oracle Fusion Legal Entity sequence")[:2]}
+    if st["phase"]=="gating":
+        key = next_gating_key(st, pack)
+        if key:
+            q = gating_question(key, pack)
+            save_state(request.state.run_id, **st)
+            return {"run_id": request.state.run_id, "phase":"gating", "ask_for":key, "complete":False, "question":q}
+        # all gating answered → derive required fields and switch phase
+        req = derive_required_fields(pack, st["gating"])
+        st["required_fields"] = req
+        # compute missing against current inputs
+        res = validator_agent.validate(st.get("inputs",{}), rules_tool)
+        st["missing"] = res["missing"]
+        st["phase"]="values"
+        save_state(request.state.run_id, **st)
 
-    ask_for = st["missing"][0]["field"] if st["missing"] else "confirmation"
-    hits = rag.retrieve(f"Legal Entity field {ask_for} US")
-    try:
-        from ceraai import llm
-        q = llm.next_best_question([h["snippet"] for h in hits], {"needed": ask_for})
-    except Exception:
-        q = f"Please provide {ask_for}."
-    return {"run_id": request.state.run_id, "complete": False, "ask_for": ask_for, "question": q, "context": hits[:2]}
+    # VALUES phase
+    if satisfied(st.get("inputs",{})):
+        return {"run_id": request.state.run_id, "phase":"values", "complete":True,
+                "question":"I have enough to generate your Legal Entity template."}
+    # pick next missing field; group address
+    missing = [m["field"] for m in st.get("missing",[])]
+    if any(x in missing for x in ["address_line1","city","state_region","postal_code"]):
+        ask_for = "address_block"
+        q = "Provide the legal address as: line1, city, state/region, postal code. Example: 123 Main St, San Jose, CA, 95110."
+    else:
+        ask_for = missing[0] if missing else "confirmation"
+        hint = (get_country_pack(st["gating"].get("country")).get("field_hints",{}) or {}).get(ask_for,"")
+        q = f"Provide {ask_for}. {hint}".strip()
+    return {"run_id": request.state.run_id, "phase":"values", "ask_for":ask_for, "complete":False, "question":q}
 
 
 
 @app.post("/interview/answer")
 def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCredentials = Depends(security)):
     if not basic_ok(credentials): raise HTTPException(status_code=401)
-    text = (payload or {}).get("text", "").strip()
-    if not text: raise HTTPException(status_code=400, detail="Provide 'text' with your answer.")
+    text = (payload or {}).get("text","").strip()
+    if not text: raise HTTPException(status_code=400, detail="Provide 'text'.")
 
     st = load_state(request.state.run_id)
-    hits = rag.retrieve("Oracle Fusion Legal Entity requirements US")
-    from ceraai import llm
-    extracted = llm.extract_fields(text, st["inputs"].get("country"), [h["snippet"] for h in hits])
+    st.setdefault("phase","gating"); st.setdefault("gating",{}); st.setdefault("inputs",{})
+    pack = get_country_pack(st["gating"].get("country") or st["inputs"].get("country"))
 
-    # merge & validate
-    st["inputs"].update(extracted or {})
+    if st["phase"]=="gating":
+        # validate gating answer against the current ask_for
+        current = next_gating_key(st, pack)
+        if not current:
+          # fall through to values
+          st["phase"]="values"
+        else:
+          ok, val = validate_gating_answer(current, text, pack)
+          if not ok:
+              return {"run_id": request.state.run_id, "phase":"gating", "accepted":False, "message":val}
+          st["gating"].update(val)
+          save_state(request.state.run_id, **st)
+          # auto-ask next question
+          nxt = interview_next(request, credentials)
+          return {"run_id": request.state.run_id, "phase":"gating", "accepted":True, "next":nxt}
+
+    # VALUES phase: extract fields from free-text
+    hits = rag.retrieve("Oracle Fusion Legal Entity fields")
+    from ceraai import llm
+    extracted = llm.extract_fields(text, st["gating"].get("country") or st["inputs"].get("country"), [h["snippet"] for h in hits])
+    if not extracted:
+        # guide the user to provide concrete values
+        return {"run_id": request.state.run_id, "phase":"values", "accepted":False,
+                "message":"I couldn’t capture any values. Reply with concrete data, e.g., “ABC, Inc., 123 Main St, San Jose, CA 95110, EIN 12-3456789.”"}
+
+    st["inputs"].update(extracted)
     res = validator_agent.validate(st["inputs"], rules_tool)
     st["missing"] = res["missing"]
     is_ready = satisfied(st["inputs"])
-
     save_state(request.state.run_id, **st)
-    return {
-        "run_id": request.state.run_id,
-        "status": "ready" if is_ready else ("ok" if res["status"]=="ok" else "incomplete"),
-        "extracted": extracted,
-        "missing": st["missing"],
-        "next_hint": (st["missing"][0]["field"] if st["missing"] else None),
-        "complete": is_ready
-    }
+
+    if is_ready:
+        return {"run_id": request.state.run_id, "phase":"values", "accepted":True, "complete":True,
+                "message":"All required data captured. You can download the template now."}
+    # not ready → auto ask next
+    nxt = interview_next(request, credentials)
+    return {"run_id": request.state.run_id, "phase":"values", "accepted":True, "complete":False,
+            "next":nxt, "missing":st["missing"], "extracted":extracted}
+
 
 
 
