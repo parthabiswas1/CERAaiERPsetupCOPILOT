@@ -472,36 +472,42 @@ def files_review(request: Request, credentials: HTTPBasicCredentials = Depends(s
 # --- Packs CRUD via DB + RAG ---------------------------------
 
 @app.post("/rag/upsert")
-def rag_upsert(payload: Dict[str, Any], credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials): raise HTTPException(status_code=401)
+def rag_upsert(payload: dict, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials):
+        raise HTTPException(status_code=401)
     # payload: {docs:[{title, text, country?, tags?}]}
     docs = payload.get("docs") or []
     n = rag.upsert_docs(docs)
     return {"upserted": n}
 
 @app.post("/rag/search")
-def rag_search(payload: Dict[str, Any], credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials): raise HTTPException(status_code=401)
-    q = payload.get("query","")
-    k = int(payload.get("top_k",5))
+def rag_search(payload: dict, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials):
+        raise HTTPException(status_code=401)
+    q = str(payload.get("query", ""))
+    k = int(payload.get("top_k", 5))
     flt = payload.get("filter")
     res = rag.search(q, top_k=k, filter_=flt)
     return {"results": res}
 
 @app.post("/packs/upsert")
-def packs_upsert(payload: Dict[str, Any], credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials): raise HTTPException(status_code=401)
+def packs_upsert(payload: dict, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials):
+        raise HTTPException(status_code=401)
     c = (payload.get("country") or "").upper()
     if not c or not payload.get("json"):
         raise HTTPException(status_code=400, detail="country and json required")
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("""INSERT INTO country_packs(country,json,version,updated_at)
-                   VALUES(?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-                   ON CONFLICT(country) DO UPDATE SET json=excluded.json,
-                       version=excluded.version, updated_at=excluded.updated_at""",
-                (c, json.dumps(payload["json"]), payload.get("version","demo")))
+    cur.execute(
+        """INSERT INTO country_packs(country,json,version,updated_at)
+           VALUES(?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+           ON CONFLICT(country) DO UPDATE SET json=excluded.json,
+               version=excluded.version, updated_at=excluded.updated_at""",
+        (c, json.dumps(payload["json"]), payload.get("version", "demo"))
+    )
     con.commit(); con.close()
-    return {"status":"ok","country":c}
+    return {"status": "ok", "country": c}
+
 
 @app.get("/packs/get/{country}")
 def packs_get(country: str, credentials: HTTPBasicCredentials = Depends(security)):
