@@ -1,6 +1,7 @@
 # ceraai/agents.py
 from typing import Dict, List
-from .tools import RAGTool, RulesTool, ERPConnector, AuditTool
+from .tools import RulesTool, ERPConnector, AuditTool
+from .rag import RAGTool
 import hashlib, time
 from . import llm
 
