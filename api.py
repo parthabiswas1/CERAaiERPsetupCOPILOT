@@ -397,135 +397,110 @@ def audit_logs(run_id: str | None = None, limit: int = 200,
     data = auditor_agent.fetch(audit_tool, limit)["logs"]
     return {"logs": [e for e in data if not run_id or e.get("run_id") == run_id]}
 
-
 @app.get("/interview/next")
 def interview_next(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials): raise HTTPException(status_code=401)
-    st = load_state(request.state.run_id)
-    st.setdefault("phase","gating")
-    st.setdefault("gating",{})
-    st.setdefault("inputs",{})
-    pack = get_country_pack(st["gating"].get("country") or st["inputs"].get("country"))
+    if not basic_ok(credentials):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # GATING PHASE
-    if st["phase"]=="gating":
-        key = next_gating_key(st, pack)
-        if key:
-            # RAG phrasing later; for now deterministic, value-seeking
-            fallback = {
-              "country": "Which country is this legal entity in? Reply with the 2-letter ISO code (e.g., US).",
-              "employ_in_country": "Will this entity employ staff in this country at go-live? Reply true or false.",
-              "sells_in_country": "Will this entity sell goods/services in this country? Reply true or false.",
-              "has_tax_id": "Do you already have a national tax ID for this entity? Reply true or false.",
-              "regulatory_category": "Regulatory category? Reply one of: none, npo, gov, fsi."
-            }
-            q = fallback.get(key, f"Provide value for {key}.")
-            st["current_ask_for"] = key
-            save_state(request.state.run_id, **st)
-            return {"run_id": request.state.run_id, "phase":"gating", "ask_for":key, "complete":False, "question":q}
+    run_id = request.state.run_id
+    st = load_state(run_id)
 
-        # all gating answered → derive required fields and switch to values
-        req = derive_required_fields(pack, st["gating"])
-        st["required_fields"] = req
-        res = validator_agent.validate(st["inputs"], rules_tool)
-        st["missing"] = res["missing"]
-        st["phase"]="values"
-        save_state(request.state.run_id, **st)
+    # Ensure gating dicts exist
+    if "gating" not in st:
+        st["gating"] = {}
+    if "inputs" not in st:
+        st["inputs"] = {}
 
-    # VALUES PHASE
-    if satisfied(st["inputs"]):
-        return {"run_id": request.state.run_id, "phase":"values", "complete":True,
-                "question":"I have enough to generate your Legal Entity template."}
+    ctry = st["gating"].get("country") or st["inputs"].get("country")
+    pack = get_country_pack(ctry)
 
-    missing = [m["field"] for m in st.get("missing",[])]
-    if any(x in missing for x in ["address_line1","city","state_region","postal_code"]):
-        ask_for = "address_block"
-        q = "Provide the legal address as: line1, city, state/region, postal code. Example: 123 Main St, San Jose, CA, 95110."
-    else:
-        ask_for = missing[0] if missing else "confirmation"
-        hint = (pack.get("field_hints",{}) or {}).get(ask_for,"")
-        q = f"Provide {ask_for}. {hint}".strip()
+    ask_for = st.get("ask_for") or next_gating_key(st, pack)
+    if not ask_for:
+        return {
+            "run_id": run_id,
+            "phase": "gating",
+            "complete": True,
+            "message": "No gating question pending. You may download the template.",
+        }
 
-    st["current_ask_for"] = ask_for
-    save_state(request.state.run_id, **st)
-    return {"run_id": request.state.run_id, "phase":"values", "ask_for":ask_for, "complete":False, "question":q}
+    st["ask_for"] = ask_for
+    save_state(run_id, **st)
+
+    return {
+        "run_id": run_id,
+        "phase": "gating",
+        "ask_for": ask_for,
+        "complete": False,
+        "question": gating_question(ask_for, pack),
+    }
+
 
 @app.post("/interview/answer")
 def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials): raise HTTPException(status_code=401)
-    text = (payload or {}).get("text","").strip()
-    if not text: raise HTTPException(status_code=400, detail="Provide 'text'.")
+    if not basic_ok(credentials):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    st = load_state(request.state.run_id)
-    st.setdefault("phase","gating"); st.setdefault("gating",{}); st.setdefault("inputs",{})
-    pack = get_country_pack(st["gating"].get("country") or st["inputs"].get("country"))
+    run_id = request.state.run_id
+    text = str(payload.get("text", "")).strip()
+    st = load_state(run_id)
 
-    # GATING
-    if st["phase"]=="gating":
-        key = next_gating_key(st, pack)
-        if not key:
-            st["phase"]="values"  # safety
+    # Ensure gating dicts exist
+    if "gating" not in st:
+        st["gating"] = {}
+    if "inputs" not in st:
+        st["inputs"] = {}
+
+    ctry = st["gating"].get("country") or st["inputs"].get("country")
+    pack = get_country_pack(ctry)
+
+    ask_for = st.get("ask_for") or next_gating_key(st, pack)
+    if not ask_for:
+        return {"run_id": run_id, "phase": "gating", "accepted": False, "message": "No gating question pending."}
+
+    ok, res = validate_gating_answer(ask_for, text, pack)
+
+    if ok:
+        # Persist answer
+        st["gating"].update(res)
+        st["inputs"].update(res)
+
+        # Find the next gating key
+        next_key = next_gating_key(st, pack)
+        if next_key:
+            st["ask_for"] = next_key
+            save_state(run_id, **st)
+            return {
+                "run_id": run_id,
+                "phase": "gating",
+                "accepted": True,
+                "next": {
+                    "run_id": run_id,
+                    "phase": "gating",
+                    "ask_for": next_key,
+                    "complete": False,
+                    "question": gating_question(next_key, pack),
+                },
+            }
         else:
-            ok, result = validate_gating_answer(key, text, pack)
-            if not ok:
-                return {"run_id": request.state.run_id, "phase":"gating", "accepted":False, "message":result}
-            st["gating"].update(result)
-            save_state(request.state.run_id, **st)
-            # Auto-ask next
-            nxt = interview_next(request, credentials)
-            return {"run_id": request.state.run_id, "phase":"gating", "accepted":True, "next":nxt}
-
-    # VALUES
-    ask_for = st.get("current_ask_for")
-    extracted = {}
-
-    if ask_for == "address_block":
-        addr = parse_address_block(text)
-        if not addr:
-            return {"run_id": request.state.run_id, "phase":"values", "accepted":False,
-                    "message":"Please provide address as: line1, city, state/region, postal code."}
-        extracted.update(addr)
-
-    elif ask_for == "ein":
-        import re
-        m = re.search(r"\b\d{2}-\d{7}\b", text)
-        if not m: return {"run_id": request.state.run_id, "phase":"values", "accepted":False,
-                          "message":"EIN format must be NN-NNNNNNN (e.g., 12-3456789)."}
-        extracted["ein"] = m.group(0)
-
-    elif ask_for == "ca_edd_id":
-        import re
-        m = re.search(r"\b\d{3}-\d{4}\b", text)
-        if not m: return {"run_id": request.state.run_id, "phase":"values", "accepted":False,
-                          "message":"Provide CA EDD Employer Account like 123-4567."}
-        extracted["ca_edd_id"] = m.group(0)
-
-    elif ask_for == "legal_name":
-        extracted["legal_name"] = text
-
-    elif ask_for == "tax_id":
-        extracted["tax_id"] = text
+            st["complete"] = True
+            st["ask_for"] = None
+            save_state(run_id, **st)
+            return {
+                "run_id": run_id,
+                "phase": "gating",
+                "accepted": True,
+                "complete": True,
+                "message": "Gating questions complete. You may now download the template.",
+            }
 
     else:
-        # Generic: set the field to the raw text
-        if ask_for and ask_for not in {"confirmation"}:
-            extracted[ask_for] = text
-
-    # Merge + validate
-    st["inputs"].update(extracted)
-    res = validator_agent.validate(st["inputs"], rules_tool)
-    st["missing"] = res["missing"]
-    is_ready = satisfied(st["inputs"])
-    save_state(request.state.run_id, **st)
-
-    if is_ready:
-        return {"run_id": request.state.run_id, "phase":"values", "accepted":True, "complete":True,
-                "message":"All required data captured. You can download the template now."}
-
-    # Auto-ask next
-    nxt = interview_next(request, credentials)
-    return {"run_id": request.state.run_id, "phase":"values", "accepted":True, "complete":False,
-            "next":nxt, "missing":st["missing"], "extracted":extracted}
+        # Validation failed
+        return {
+            "run_id": run_id,
+            "phase": "gating",
+            "accepted": False,
+            "message": res,
+        }
 
 
 @app.post("/map")
