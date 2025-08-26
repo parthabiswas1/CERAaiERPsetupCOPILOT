@@ -1,7 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, File, UploadFile
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.responses import JSONResponse
-from fastapi import Request
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from uuid import uuid4
 import sqlite3, os, hashlib, time, json
 from typing import Dict
@@ -9,9 +8,17 @@ from ceraai.tools import RAGTool, RulesTool, ERPConnector, AuditTool
 from ceraai.agents import InterviewAgent, ValidatorAgent, MapperAgent, ExecutorAgent, AuditorAgent
 import random
 from fastapi.middleware.cors import CORSMiddleware
+from io import BytesIO
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill
+import pathlib, json
+
 
 DB_PATH = os.getenv("DB_PATH", "rules.sqlite")  # default file name if DB_PATH is not set
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # set to your UI origin later
+
+UPLOAD_ROOT = pathlib.Path("/tmp/ceraai_uploads")
+UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="CERAai ERP Setup Copilot - MVP")
 security = HTTPBasic()
@@ -49,6 +56,11 @@ auditor_agent   = AuditorAgent()
 audit_tool      = AuditTool()
 mapper_agent    = MapperAgent()
 
+
+def _run_dir(run_id: str) -> pathlib.Path:
+    d = UPLOAD_ROOT / run_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def init_db():
@@ -291,3 +303,120 @@ def map_to_fusion(payload: dict | None = None, request: Request = None,
     mapped = mapper_agent.map_to_fusion(st["inputs"])
     st["mapped"] = mapped; save_state(request.state.run_id, **st)
     return {"run_id": request.state.run_id, "status":"ok", "mapped": mapped}
+
+def build_template_xlsx(country: str = "US") -> BytesIO:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "LegalEntity"
+
+    base_cols = ["legal_name","country","address_line1","city","state_region","postal_code"]
+    if (country or "US").upper() == "US":
+        cols = base_cols + ["ein","employees_in_CA","ca_edd_id"]
+    else:
+        cols = base_cols + ["tax_id"]
+
+    ws.append(cols)
+    # example row for guidance
+    demo = ["ABC, Inc.", country, "123 Main St", "San Jose", "CA", "95110"]
+    if country.upper()=="US":
+        demo += ["12-3456789", "false", ""]
+    else:
+        demo += ["TAX-XXX"]
+    ws.append(demo)
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+@app.get("/template/draft")
+def template_draft(request: Request, country: str | None = None,
+                   credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
+    st = load_state(request.state.run_id)
+    ctry = (country or st["inputs"].get("country") or "US").upper()
+    xlsx = build_template_xlsx(ctry)
+    return StreamingResponse(xlsx, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": f'attachment; filename="legal_entity_template_{ctry}.xlsx"'})
+
+
+@app.post("/files/upload")
+async def files_upload(request: Request, file: UploadFile = File(...),
+                       credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
+    if not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Only .xlsx accepted")
+    contents = await file.read()
+    if len(contents) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 10MB)")
+    p = _run_dir(request.state.run_id) / "uploaded.xlsx"
+    p.write_bytes(contents)
+    return {"run_id": request.state.run_id, "stored": True, "path": str(p)}
+
+
+@app.post("/files/validate")
+def files_validate(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
+    p = _run_dir(request.state.run_id) / "uploaded.xlsx"
+    if not p.exists():
+        raise HTTPException(status_code=400, detail="No uploaded file for this run. POST /files/upload first.")
+
+    wb = load_workbook(p)
+    ws = wb.active
+    headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    issues = []
+
+    # required columns (US as default); country from state if present
+    st = load_state(request.state.run_id)
+    ctry = (st["inputs"].get("country") or "US").upper()
+    base_req = ["legal_name","country","address_line1","city","state_region","postal_code"]
+    req = base_req + (["ein"] if ctry=="US" else ["tax_id"])
+
+    for col in req:
+        if col not in headers:
+            issues.append({"row": 1, "field": col, "error": "Missing required column"})
+
+    # per-row empties for first data row (row 2)
+    hdr_idx = {h:i for i,h in enumerate(headers)}
+    if not issues and ws.max_row >= 2:
+        r = 2
+        for col in req:
+            cell = ws.cell(row=r, column=hdr_idx[col]+1)
+            if cell.value in (None, ""):
+                issues.append({"row": r, "field": col, "error": "Value required"})
+
+    # produce review.xlsx with Errors column + highlight
+    if "Errors" not in headers:
+        ws.cell(row=1, column=len(headers)+1, value="Errors")
+        headers.append("Errors")
+    red = PatternFill(start_color="FFFECACA", end_color="FFFECACA", fill_type="solid")
+    for item in issues:
+        r = item["row"]
+        # append message into Errors column
+        err_col = len(headers)
+        curr = ws.cell(row=r, column=err_col).value or ""
+        msg = f"{item['field']}: {item['error']}"
+        ws.cell(row=r, column=err_col, value=(curr + ("; " if curr else "") + msg))
+        # highlight offending cell if we can
+        if item["field"] in hdr_idx:
+            ws.cell(row=r, column=hdr_idx[item["field"]]+1).fill = red
+
+    review_path = _run_dir(request.state.run_id) / "review.xlsx"
+    wb.save(review_path)
+
+    return {"run_id": request.state.run_id, "issues": issues,
+            "review_download": "/files/review"}
+
+
+@app.get("/files/review")
+def files_review(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
+    review_path = _run_dir(request.state.run_id) / "review.xlsx"
+    if not review_path.exists():
+        raise HTTPException(status_code=404, detail="No review file for this run.")
+    return FileResponse(review_path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        filename="review.xlsx")
+
+
+
