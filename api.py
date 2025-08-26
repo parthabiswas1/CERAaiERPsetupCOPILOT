@@ -145,12 +145,20 @@ def load_state(run_id: str) -> dict:
     return base
 
 def save_state(run_id: str, **st):
-    _ensure_runs_table()
+    # Avoid arg collision when callers pass st containing 'run_id'
+    st = dict(st)
+    st.pop("run_id", None)
+
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
+    # Ensure row exists
     cur.execute("INSERT OR IGNORE INTO runs (run_id) VALUES (?)", (run_id,))
 
+    # Discover existing columns
     cols_info = cur.execute("PRAGMA table_info(runs)").fetchall()
     existing = {c[1] for c in cols_info}
+
+    def _jdump(x):
+        return json.dumps(x) if x is not None else None
 
     values_map = {
         "inputs": _jdump(st.get("inputs", {})),
@@ -171,17 +179,10 @@ def save_state(run_id: str, **st):
             set_vals.append(val)
     set_vals.append(run_id)
 
-    if set_cols:
-        cur.execute(f"UPDATE runs SET {', '.join(set_cols)} WHERE run_id=?", set_vals)
-        con.commit()
-    con.close()
+    cur.execute(f"UPDATE runs SET {', '.join(set_cols)} WHERE run_id=?", set_vals)
+    con.commit(); con.close()
 
-    # Update MEM fallback too
-    ms = MEM_STATE.setdefault(run_id, {})
-    for k in ["inputs", "missing", "mapped", "result", "gating",
-              "phase", "required_fields", "current_ask_for"]:
-        if k in st:
-            ms[k] = st[k]
+
 
 # =====================================================
 #                 Business Logic helpers
