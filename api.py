@@ -7,12 +7,12 @@ from io import BytesIO
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill
 from datetime import datetime
-
+from typing import Any
 import os, sqlite3, json, pathlib
 
-# --- External tools/agents you already have ---
-from ceraai.tools import RAGTool, RulesTool, ERPConnector, AuditTool
+from ceraai.tools import RulesTool, ERPConnector, AuditTool
 from ceraai.agents import InterviewAgent, ValidatorAgent, MapperAgent, ExecutorAgent, AuditorAgent
+from ceraai.rag import RAGTool
 
 # ---------- Config ----------
 DB_PATH = os.getenv("DB_PATH", str(pathlib.Path("/tmp/ceraai.db")))
@@ -138,18 +138,26 @@ def basic_ok(creds: HTTPBasicCredentials):
 GATING_ORDER = ["country","employ_in_country","sells_in_country","has_tax_id","regulatory_category"]
 
 def get_country_pack(ctry: str | None):
-    # TODO: swap to Pinecone RAG; fallback pack
-    return {
-      "country": (ctry or "US").upper(),
-      "base_fields": ["legal_name","country","address_line1","city","state_region","postal_code","ein"],
-      "gating": [
-        {"key":"employ_in_country","type":"bool","on_true_add":["employer_registration_id"]},
-        {"key":"sells_in_country","type":"bool","on_true_add":["indirect_tax_id"]},
-        {"key":"has_tax_id","type":"bool"},
-        {"key":"regulatory_category","type":"enum","options":["none","npo","gov","fsi"],"map":{"fsi":["regulator_code"]}}
-      ],
-      "field_hints": {"ein":"Format NN-NNNNNNN.","indirect_tax_id":"Sales/VAT permit if selling."}
-    }
+    c = (ctry or "US").upper()
+    # 1) try DB
+    con = sqlite3.connect(DB_PATH); cur = con.cursor()
+    cur.execute("SELECT json FROM country_packs WHERE country=?", (c,))
+    row = cur.fetchone()
+    con.close()
+    if row:
+        return json.loads(row[0])
+
+    # 2) generate via RAG, persist, return
+    pack = rag.generate_pack(c)
+    con = sqlite3.connect(DB_PATH); cur = con.cursor()
+    cur.execute("""INSERT INTO country_packs(country,json,version,updated_at)
+                   VALUES(?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                   ON CONFLICT(country) DO UPDATE SET json=excluded.json,
+                       version=excluded.version, updated_at=excluded.updated_at""",
+                (c, json.dumps(pack), "rag-derivative"))
+    con.commit(); con.close()
+    return pack
+
 
 def normalize_country(text: str) -> str | None:
     t = text.strip().lower()
@@ -459,6 +467,52 @@ def files_review(request: Request, credentials: HTTPBasicCredentials = Depends(s
         raise HTTPException(status_code=404, detail="No review file for this run.")
     return FileResponse(review_path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         filename="review.xlsx")
+
+
+# --- Packs CRUD via DB + RAG ---------------------------------
+
+@app.post("/rag/upsert")
+def rag_upsert(payload: Dict[str, Any], credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials): raise HTTPException(status_code=401)
+    # payload: {docs:[{title, text, country?, tags?}]}
+    docs = payload.get("docs") or []
+    n = rag.upsert_docs(docs)
+    return {"upserted": n}
+
+@app.post("/rag/search")
+def rag_search(payload: Dict[str, Any], credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials): raise HTTPException(status_code=401)
+    q = payload.get("query","")
+    k = int(payload.get("top_k",5))
+    flt = payload.get("filter")
+    res = rag.search(q, top_k=k, filter_=flt)
+    return {"results": res}
+
+@app.post("/packs/upsert")
+def packs_upsert(payload: Dict[str, Any], credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials): raise HTTPException(status_code=401)
+    c = (payload.get("country") or "").upper()
+    if not c or not payload.get("json"):
+        raise HTTPException(status_code=400, detail="country and json required")
+    con = sqlite3.connect(DB_PATH); cur = con.cursor()
+    cur.execute("""INSERT INTO country_packs(country,json,version,updated_at)
+                   VALUES(?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                   ON CONFLICT(country) DO UPDATE SET json=excluded.json,
+                       version=excluded.version, updated_at=excluded.updated_at""",
+                (c, json.dumps(payload["json"]), payload.get("version","demo")))
+    con.commit(); con.close()
+    return {"status":"ok","country":c}
+
+@app.get("/packs/get/{country}")
+def packs_get(country: str, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials): raise HTTPException(status_code=401)
+    con = sqlite3.connect(DB_PATH); cur = con.cursor()
+    cur.execute("SELECT json,version,updated_at FROM country_packs WHERE country=?", (country.upper(),))
+    row = cur.fetchone(); con.close()
+    if not row: raise HTTPException(status_code=404, detail="Not found")
+    js, ver, ts = row
+    return {"country": country.upper(), "json": json.loads(js), "version": ver, "updated_at": ts}
+
 
 # ---------- Startup ----------
 @app.on_event("startup")
