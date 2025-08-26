@@ -13,7 +13,6 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill
 import pathlib, json
 
-
 DB_PATH = os.getenv("DB_PATH", "rules.sqlite")  # default file name if DB_PATH is not set
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # set to your UI origin later
 
@@ -196,7 +195,7 @@ def satisfied(inputs: dict) -> bool:
 GATING_ORDER = ["country","employ_in_country","sells_in_country","has_tax_id","regulatory_category"]
 
 def get_country_pack(ctry: str | None):
-    # TODO: fetch from Pinecone via RAGTool; fallback to US
+    # TODO: replace with Pinecone RAG fetch; fallback pack for now
     return {
       "country": (ctry or "US").upper(),
       "base_fields": ["legal_name","country","address_line1","city","state_region","postal_code","ein"],
@@ -209,37 +208,47 @@ def get_country_pack(ctry: str | None):
       "field_hints": {"ein":"Format NN-NNNNNNN.","indirect_tax_id":"Sales/VAT permit if selling."}
     }
 
-def normalize_country(text:str)->str|None:
-    t=text.strip().lower()
-    if t in {"us","usa","united states","united states of america"}: return "US"
-    return t.upper() if len(t)==2 else None
+def normalize_country(text: str) -> str | None:
+    t = text.strip().lower()
+    if t in {"us","usa","united states","united states of america"}:
+        return "US"
+    return t.upper() if len(t) == 2 else None
 
-def parse_bool(text:str)->bool|None:
-    t=text.strip().lower()
+def parse_bool(text: str) -> bool | None:
+    t = text.strip().lower()
     if t in {"true","yes","y"}: return True
     if t in {"false","no","n"}: return False
     return None
 
-def validate_gating_answer(key:str, text:str, pack:dict):
-    if key=="country":
-        c=normalize_country(text); return (True, {"country":c}) if c else (False,"Provide a valid 2-letter ISO code (e.g., US).")
+
+def _reg_opts(pack: dict) -> set:
+    for g in pack.get("gating", []):
+        if g.get("key") == "regulatory_category":
+            return set(g.get("options", []))
+    return {"none","npo","gov","fsi"}  # fallback
+
+def validate_gating_answer(key: str, text: str, pack: dict):
+    if key == "country":
+        c = normalize_country(text)
+        return (True, {"country": c}) if c else (False, "Reply with a valid 2-letter ISO code (e.g., US).")
     if key in {"employ_in_country","sells_in_country","has_tax_id"}:
-        b=parse_bool(text); return (True,{key:b}) if b is not None else (False,"Reply exactly: true or false.")
-    if key=="regulatory_category":
-        opts=set(pack.get("gating",[])[3]["options"]) if pack.get("gating") else set()
-        v=text.strip().lower()
-        return (True, {key:v}) if (not opts or v in opts) else (False, f"Choose one of: {', '.join(opts)}.")
+        b = parse_bool(text)
+        return (True, {key: b}) if b is not None else (False, "Reply exactly: true or false.")
+    if key == "regulatory_category":
+        opts = _reg_opts(pack)
+        v = text.strip().lower()
+        return (True, {key: v}) if v in opts else (False, f"Choose one of: {', '.join(sorted(opts))}.")
     return (False, "Unsupported gating key.")
 
-def next_gating_key(st, pack):
+def next_gating_key(st: dict, pack: dict) -> str | None:
     g = st.get("gating", {})
     for k in GATING_ORDER:
         if g.get(k) in (None, ""):
             return k
     return None
 
-def gating_question(key:str, pack:dict)->str:
-    # Prefer RAG phrasing; fallback:
+def gating_question(key: str, pack: dict) -> str:
+    # (RAG phrasing later) deterministic, value-seeking fallback
     fallback = {
       "country": "Which country is this legal entity in? Reply with the 2-letter ISO code (e.g., US).",
       "employ_in_country": "Will this entity employ staff in this country at go-live? Reply true or false.",
@@ -249,17 +258,42 @@ def gating_question(key:str, pack:dict)->str:
     }
     return fallback.get(key, f"Provide value for {key}.")
 
-def derive_required_fields(pack:dict, gating:dict)->list[str]:
+def derive_required_fields(pack: dict, gating: dict) -> list[str]:
     req = list(pack["base_fields"])
     for g in pack["gating"]:
         k = g["key"]; v = gating.get(k)
         if v is True and "on_true_add" in g:
             req += g["on_true_add"]
-        if v and isinstance(v,str) and g.get("type")=="enum":
-            extra = (g.get("map") or {}).get(v, [])
-            req += extra
-    # de-dup
+        if isinstance(v, str) and g.get("type") == "enum":
+            req += (g.get("map") or {}).get(v, [])
+    # de-dup while preserving order
     return list(dict.fromkeys(req))
+
+
+def parse_address_block(txt: str) -> dict | None:
+    parts = [p.strip() for p in txt.split(",")]
+    if len(parts) < 4:
+        return None
+    return {
+        "address_line1": parts[0],
+        "city": parts[1],
+        "state_region": parts[2],
+        "postal_code": parts[3],
+    }
+
+
+def satisfied(inputs: dict) -> bool:
+    ctry = (inputs.get("country") or "").upper()
+    if ctry == "US":
+        base = all(inputs.get(k) for k in [
+            "legal_name","country","address_line1","city","state_region","postal_code","ein"
+        ])
+        return bool(base)
+    # Non-US minimal (adjust per pack when RAG is wired)
+    return all(inputs.get(k) for k in [
+        "legal_name","country","address_line1","city","state_region","postal_code","tax_id"
+    ])
+
 
 
 
@@ -337,39 +371,51 @@ def interview_next(request: Request, credentials: HTTPBasicCredentials = Depends
     st = load_state(request.state.run_id)
     st.setdefault("phase","gating")
     st.setdefault("gating",{})
+    st.setdefault("inputs",{})
     pack = get_country_pack(st["gating"].get("country") or st["inputs"].get("country"))
 
+    # GATING PHASE
     if st["phase"]=="gating":
         key = next_gating_key(st, pack)
         if key:
-            q = gating_question(key, pack)
+            # RAG phrasing later; for now deterministic, value-seeking
+            fallback = {
+              "country": "Which country is this legal entity in? Reply with the 2-letter ISO code (e.g., US).",
+              "employ_in_country": "Will this entity employ staff in this country at go-live? Reply true or false.",
+              "sells_in_country": "Will this entity sell goods/services in this country? Reply true or false.",
+              "has_tax_id": "Do you already have a national tax ID for this entity? Reply true or false.",
+              "regulatory_category": "Regulatory category? Reply one of: none, npo, gov, fsi."
+            }
+            q = fallback.get(key, f"Provide value for {key}.")
+            st["current_ask_for"] = key
             save_state(request.state.run_id, **st)
             return {"run_id": request.state.run_id, "phase":"gating", "ask_for":key, "complete":False, "question":q}
-        # all gating answered → derive required fields and switch phase
+
+        # all gating answered → derive required fields and switch to values
         req = derive_required_fields(pack, st["gating"])
         st["required_fields"] = req
-        # compute missing against current inputs
-        res = validator_agent.validate(st.get("inputs",{}), rules_tool)
+        res = validator_agent.validate(st["inputs"], rules_tool)
         st["missing"] = res["missing"]
         st["phase"]="values"
         save_state(request.state.run_id, **st)
 
-    # VALUES phase
-    if satisfied(st.get("inputs",{})):
+    # VALUES PHASE
+    if satisfied(st["inputs"]):
         return {"run_id": request.state.run_id, "phase":"values", "complete":True,
                 "question":"I have enough to generate your Legal Entity template."}
-    # pick next missing field; group address
+
     missing = [m["field"] for m in st.get("missing",[])]
     if any(x in missing for x in ["address_line1","city","state_region","postal_code"]):
         ask_for = "address_block"
         q = "Provide the legal address as: line1, city, state/region, postal code. Example: 123 Main St, San Jose, CA, 95110."
     else:
         ask_for = missing[0] if missing else "confirmation"
-        hint = (get_country_pack(st["gating"].get("country")).get("field_hints",{}) or {}).get(ask_for,"")
+        hint = (pack.get("field_hints",{}) or {}).get(ask_for,"")
         q = f"Provide {ask_for}. {hint}".strip()
+
+    st["current_ask_for"] = ask_for
+    save_state(request.state.run_id, **st)
     return {"run_id": request.state.run_id, "phase":"values", "ask_for":ask_for, "complete":False, "question":q}
-
-
 
 @app.post("/interview/answer")
 def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCredentials = Depends(security)):
@@ -381,31 +427,58 @@ def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCred
     st.setdefault("phase","gating"); st.setdefault("gating",{}); st.setdefault("inputs",{})
     pack = get_country_pack(st["gating"].get("country") or st["inputs"].get("country"))
 
+    # GATING
     if st["phase"]=="gating":
-        # validate gating answer against the current ask_for
-        current = next_gating_key(st, pack)
-        if not current:
-          # fall through to values
-          st["phase"]="values"
+        key = next_gating_key(st, pack)
+        if not key:
+            st["phase"]="values"  # safety
         else:
-          ok, val = validate_gating_answer(current, text, pack)
-          if not ok:
-              return {"run_id": request.state.run_id, "phase":"gating", "accepted":False, "message":val}
-          st["gating"].update(val)
-          save_state(request.state.run_id, **st)
-          # auto-ask next question
-          nxt = interview_next(request, credentials)
-          return {"run_id": request.state.run_id, "phase":"gating", "accepted":True, "next":nxt}
+            ok, result = validate_gating_answer(key, text, pack)
+            if not ok:
+                return {"run_id": request.state.run_id, "phase":"gating", "accepted":False, "message":result}
+            st["gating"].update(result)
+            save_state(request.state.run_id, **st)
+            # Auto-ask next
+            nxt = interview_next(request, credentials)
+            return {"run_id": request.state.run_id, "phase":"gating", "accepted":True, "next":nxt}
 
-    # VALUES phase: extract fields from free-text
-    hits = rag.retrieve("Oracle Fusion Legal Entity fields")
-    from ceraai import llm
-    extracted = llm.extract_fields(text, st["gating"].get("country") or st["inputs"].get("country"), [h["snippet"] for h in hits])
-    if not extracted:
-        # guide the user to provide concrete values
-        return {"run_id": request.state.run_id, "phase":"values", "accepted":False,
-                "message":"I couldn’t capture any values. Reply with concrete data, e.g., “ABC, Inc., 123 Main St, San Jose, CA 95110, EIN 12-3456789.”"}
+    # VALUES
+    ask_for = st.get("current_ask_for")
+    extracted = {}
 
+    if ask_for == "address_block":
+        addr = parse_address_block(text)
+        if not addr:
+            return {"run_id": request.state.run_id, "phase":"values", "accepted":False,
+                    "message":"Please provide address as: line1, city, state/region, postal code."}
+        extracted.update(addr)
+
+    elif ask_for == "ein":
+        import re
+        m = re.search(r"\b\d{2}-\d{7}\b", text)
+        if not m: return {"run_id": request.state.run_id, "phase":"values", "accepted":False,
+                          "message":"EIN format must be NN-NNNNNNN (e.g., 12-3456789)."}
+        extracted["ein"] = m.group(0)
+
+    elif ask_for == "ca_edd_id":
+        import re
+        m = re.search(r"\b\d{3}-\d{4}\b", text)
+        if not m: return {"run_id": request.state.run_id, "phase":"values", "accepted":False,
+                          "message":"Provide CA EDD Employer Account like 123-4567."}
+        extracted["ca_edd_id"] = m.group(0)
+
+    elif ask_for == "legal_name":
+        extracted["legal_name"] = text
+
+    elif ask_for == "tax_id":
+        extracted["tax_id"] = text
+
+    else:
+        # Generic: set the field to the raw text
+        if ask_for and ask_for not in {"confirmation"}:
+            extracted[ask_for] = text
+
+    # Merge + validate
     st["inputs"].update(extracted)
     res = validator_agent.validate(st["inputs"], rules_tool)
     st["missing"] = res["missing"]
@@ -415,12 +488,11 @@ def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCred
     if is_ready:
         return {"run_id": request.state.run_id, "phase":"values", "accepted":True, "complete":True,
                 "message":"All required data captured. You can download the template now."}
-    # not ready → auto ask next
+
+    # Auto-ask next
     nxt = interview_next(request, credentials)
     return {"run_id": request.state.run_id, "phase":"values", "accepted":True, "complete":False,
             "next":nxt, "missing":st["missing"], "extracted":extracted}
-
-
 
 
 @app.post("/map")
@@ -440,25 +512,38 @@ def map_to_fusion(payload: dict | None = None, request: Request = None,
     st["mapped"] = mapped; save_state(request.state.run_id, **st)
     return {"run_id": request.state.run_id, "status":"ok", "mapped": mapped}
 
-def build_template_xlsx(country: str = "US") -> BytesIO:
+# --- Dynamic XLSX template builder ---
+def build_template_xlsx(country: str = "US", required_fields: list[str] | None = None) -> BytesIO:
     wb = Workbook()
     ws = wb.active
     ws.title = "LegalEntity"
 
-    base_cols = ["legal_name","country","address_line1","city","state_region","postal_code"]
-    if (country or "US").upper() == "US":
-        cols = base_cols + ["ein","employees_in_CA","ca_edd_id"]
+    ctry = (country or "US").upper()
+
+    # Columns: use derived required_fields if present; otherwise fall back
+    if required_fields and isinstance(required_fields, list) and required_fields:
+        cols = required_fields
     else:
-        cols = base_cols + ["tax_id"]
+        base_cols = ["legal_name","country","address_line1","city","state_region","postal_code"]
+        cols = base_cols + (["ein"] if ctry == "US" else ["tax_id"])
 
     ws.append(cols)
-    # example row for guidance
-    demo = ["ABC, Inc.", country, "123 Main St", "San Jose", "CA", "95110"]
-    if country.upper()=="US":
-        demo += ["12-3456789", "false", ""]
-    else:
-        demo += ["TAX-XXX"]
-    ws.append(demo)
+
+    # Guidance/demo row mapped by header name (only fills what exists)
+    demo_map = {
+        "legal_name": "ABC, Inc.",
+        "country": ctry,
+        "address_line1": "123 Main St",
+        "city": "San Jose",
+        "state_region": "CA",
+        "postal_code": "95110",
+        "ein": "12-3456789",
+        "tax_id": "TAX-XXX",
+        "employer_registration_id": "",
+        "indirect_tax_id": "",
+        "regulator_code": "",
+    }
+    ws.append([demo_map.get(c, "") for c in cols])
 
     buf = BytesIO()
     wb.save(buf)
@@ -469,12 +554,23 @@ def build_template_xlsx(country: str = "US") -> BytesIO:
 @app.get("/template/draft")
 def template_draft(request: Request, country: str | None = None,
                    credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
+    if not basic_ok(credentials):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     st = load_state(request.state.run_id)
-    ctry = (country or st["inputs"].get("country") or "US").upper()
-    xlsx = build_template_xlsx(ctry)
-    return StreamingResponse(xlsx, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                             headers={"Content-Disposition": f'attachment; filename="legal_entity_template_{ctry}.xlsx"'})
+    ctry = (country
+            or st.get("gating", {}).get("country")
+            or st.get("inputs", {}).get("country")
+            or "US").upper()
+    fields = st.get("required_fields")  # set after gating is complete
+
+    xlsx = build_template_xlsx(ctry, fields)
+    return StreamingResponse(
+        xlsx,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="legal_entity_template_{ctry}.xlsx"'}
+    )
+
 
 
 @app.post("/files/upload")
