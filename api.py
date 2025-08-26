@@ -51,6 +51,16 @@ def init_db():
       run_id TEXT PRIMARY KEY
     )
     """)
+
+    # country_packs: stores normalized “pack” JSON per country
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS country_packs (
+      country TEXT PRIMARY KEY,
+      json TEXT NOT NULL,
+      version TEXT DEFAULT 'demo',
+      updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    )""")
+    
     # Add columns if missing
     def _add(col, ddl):
         try: cur.execute(f"ALTER TABLE runs ADD COLUMN {col} {ddl}")
