@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, Request, File, UploadFile
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from uuid import uuid4
-import sqlite3, os, hashlib, time, json
+import sqlite3, os, hashlib, time, json, pathlib
 from typing import Dict
 from ceraai.tools import RAGTool, RulesTool, ERPConnector, AuditTool
 from ceraai.agents import InterviewAgent, ValidatorAgent, MapperAgent, ExecutorAgent, AuditorAgent
@@ -11,9 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from io import BytesIO
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill
-import pathlib, json
 
-DB_PATH = os.getenv("DB_PATH", "rules.sqlite")  # default file name if DB_PATH is not set
+
+
+DB_PATH = os.getenv("DB_PATH", str(pathlib.Path("/tmp/ceraai.db")))
+
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # set to your UI origin later
 
 UPLOAD_ROOT = pathlib.Path("/tmp/ceraai_uploads")
@@ -62,62 +64,107 @@ def _run_dir(run_id: str) -> pathlib.Path:
     return d
 
 
+# --- state persistence---
+
+
 def init_db():
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-
-    # pragmas for stability on lightweight hosts
-    cur.execute("PRAGMA journal_mode=WAL;")
-    cur.execute("PRAGMA foreign_keys=ON;")
-
-    # --- rules (validator) ---
+    con = sqlite3.connect(DB_PATH); cur = con.cursor()
+    # Create table (new installs)
     cur.execute("""
-      CREATE TABLE IF NOT EXISTS rules (
-        id INTEGER PRIMARY KEY,
-        country TEXT,
-        condition_key TEXT,
-        condition_value TEXT,
-        field TEXT,
-        mandatory INTEGER,
-        message TEXT
-      )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_rules_country ON rules(country)")
-    cur.execute("SELECT COUNT(*) FROM rules")
-    if cur.fetchone()[0] == 0:
-        cur.executemany(
-            "INSERT INTO rules(country,condition_key,condition_value,field,mandatory,message) VALUES(?,?,?,?,?,?)",
-            [
-              ("US", None, None, "ein", 1, "EIN is required for US entities."),
-              ("US", "employees_in_CA", "true", "ca_edd_id", 1, "CA EDD ID required if employees in CA.")
-            ]
-        )
+    CREATE TABLE IF NOT EXISTS runs (
+      run_id TEXT PRIMARY KEY,
+      inputs TEXT DEFAULT '{}',
+      missing TEXT DEFAULT '[]',
+      mapped TEXT,
+      result TEXT,
+      gating TEXT DEFAULT '{}',
+      phase TEXT DEFAULT 'gating',
+      required_fields TEXT,
+      current_ask_for TEXT,
+      created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    )""")
+    # Add columns if migrating from old schema
+    def _add(col, ddl):
+        try:
+            cur.execute(f"ALTER TABLE runs ADD COLUMN {col} {ddl}")
+        except Exception:
+            pass
+    _add("gating", "TEXT DEFAULT '{}'")
+    _add("phase", "TEXT DEFAULT 'gating'")
+    _add("required_fields", "TEXT")
+    _add("current_ask_for", "TEXT")
+    _add("created_at", "TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
+    con.commit(); con.close()
 
-    # --- runs (shared state per run_id) ---
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS runs (
-        run_id    TEXT PRIMARY KEY,
-        inputs    TEXT,   -- JSON
-        missing   TEXT,   -- JSON
-        mapped    TEXT,   -- JSON
-        result    TEXT,   -- JSON
-        updated_at INTEGER
-      )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_updated ON runs(updated_at)")
+def _jdump(x):
+    return json.dumps(x) if x is not None else None
 
-    # --- idem (idempotency cache) ---
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS idem (
-        action TEXT,
-        key    TEXT,
-        resp   TEXT,  -- JSON
-        PRIMARY KEY(action, key)
-      )
-    """)
+def _jload(s, default):
+    try:
+        return json.loads(s) if s not in (None, "") else default
+    except Exception:
+        return default
 
-    con.commit()
+def load_state(run_id: str) -> dict:
+    con = sqlite3.connect(DB_PATH); cur = con.cursor()
+    cur.execute("""SELECT inputs, missing, mapped, result, gating, phase, required_fields, current_ask_for
+                   FROM runs WHERE run_id=?""", (run_id,))
+    row = cur.fetchone()
     con.close()
+    if not row:
+        # initialize empty state
+        return {
+            "run_id": run_id,
+            "inputs": {},
+            "missing": [],
+            "mapped": None,
+            "result": None,
+            "gating": {},
+            "phase": "gating",
+            "required_fields": None,
+            "current_ask_for": None,
+        }
+    inputs, missing, mapped, result, gating, phase, required_fields, current_ask_for = row
+    return {
+        "run_id": run_id,
+        "inputs": _jload(inputs, {}),
+        "missing": _jload(missing, []),
+        "mapped": _jload(mapped, None),
+        "result": _jload(result, None),
+        "gating": _jload(gating, {}),
+        "phase": phase or "gating",
+        "required_fields": _jload(required_fields, None),
+        "current_ask_for": current_ask_for,
+    }
+
+def save_state(run_id: str, **st):
+    # ensure row exists
+    con = sqlite3.connect(DB_PATH); cur = con.cursor()
+    cur.execute("INSERT OR IGNORE INTO runs (run_id, inputs, missing) VALUES (?, '{}', '[]')", (run_id,))
+    cur.execute("""UPDATE runs SET
+        inputs=?,
+        missing=?,
+        mapped=?,
+        result=?,
+        gating=?,
+        phase=?,
+        required_fields=?,
+        current_ask_for=?
+        WHERE run_id=?""",
+        (
+            _jdump(st.get("inputs", {})),
+            _jdump(st.get("missing", [])),
+            _jdump(st.get("mapped", None)),
+            _jdump(st.get("result", None)),
+            _jdump(st.get("gating", {})),
+            st.get("phase", "gating"),
+            _jdump(st.get("required_fields", None)),
+            st.get("current_ask_for"),
+            run_id,
+        )
+    )
+    con.commit(); con.close()
+
 
 def _conn(): return sqlite3.connect(DB_PATH)
 
