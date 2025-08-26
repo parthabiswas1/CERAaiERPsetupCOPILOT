@@ -137,28 +137,10 @@ def basic_ok(creds: HTTPBasicCredentials):
 # Gating logic
 GATING_ORDER = ["country","employ_in_country","sells_in_country","has_tax_id","regulatory_category"]
 
-def get_country_pack(ctry: str | None):
-    c = (ctry or "US").upper()
+def _default_pack(code: str) -> dict:
+    code = (code or "US").upper()
 
-    # Try DB-backed pack first
-    try:
-        con = sqlite3.connect(DB_PATH); cur = con.cursor()
-        cur.execute("SELECT json FROM country_packs WHERE country=?", (c,))
-        row = cur.fetchone()
-        con.close()
-        if row and row[0]:
-            pack = json.loads(row[0])
-            # Ensure required keys exist
-            pack.setdefault("country", c)
-            pack.setdefault("base_fields", [])
-            pack.setdefault("gating", [])
-            pack.setdefault("field_hints", {})
-            return pack
-    except Exception:
-        pass
-
-    # Fallback defaults
-    if c == "US":
+    if code == "US":
         return {
             "country": "US",
             "base_fields": ["legal_name","country","address_line1","city","state_region","postal_code","ein"],
@@ -166,22 +148,106 @@ def get_country_pack(ctry: str | None):
                 {"key":"employ_in_country","type":"bool","on_true_add":["employer_registration_id"]},
                 {"key":"sells_in_country","type":"bool","on_true_add":["indirect_tax_id"]},
                 {"key":"has_tax_id","type":"bool"},
-                {"key":"regulatory_category","type":"enum","options":["none","npo","gov","fsi"],"map":{"fsi":["regulator_code"]}}
+                {"key":"regulatory_category","type":"enum","options":["none","npo","gov","fsi"],"map":{"fsi":["regulator_code"]}},
             ],
-            "field_hints": {"ein":"Format NN-NNNNNNN.","indirect_tax_id":"Sales/VAT permit if selling."}
+            "field_hints": {
+                "ein": "Format NN-NNNNNNN.",
+                "indirect_tax_id": "Sales/VAT permit if selling."
+            },
         }
-    # Generic non-US fallback
+
+    if code == "UK":
+        return {
+            "country": "UK",
+            "base_fields": ["legal_name","country","address_line1","city","state_region","postal_code","crn"],
+            "gating": [
+                {"key":"employ_in_country","type":"bool","on_true_add":["paye_employer_ref","paye_accounts_office_ref"]},
+                {"key":"sells_in_country","type":"bool","on_true_add":["vat_number"]},
+                {"key":"has_tax_id","type":"bool","on_true_add":["utr"]},
+                {"key":"regulatory_category","type":"enum","options":["none","npo","gov","fsi"],"map":{"fsi":["regulator_code"]}},
+            ],
+            "field_hints": {
+                "crn": "Companies House Number.",
+                "utr": "Unique Taxpayer Reference.",
+                "vat_number": "Add if VAT threshold met."
+            },
+        }
+
+    if code == "IN":
+        return {
+            "country": "IN",
+            "base_fields": ["legal_name","country","address_line1","city","state_region","postal_code","cin","pan"],
+            "gating": [
+                {"key":"employ_in_country","type":"bool","on_true_add":["epfo_reg_no","esic_no"]},
+                {"key":"sells_in_country","type":"bool","on_true_add":["gstin"]},
+                {"key":"has_tax_id","type":"bool","on_true_add":["tan"]},
+                {"key":"regulatory_category","type":"enum","options":["none","npo","gov","fsi"],"map":{"fsi":["regulator_code"]}},
+            ],
+            "field_hints": {
+                "pan": "Permanent Account Number.",
+                "gstin": "Goods & Services Tax ID if selling.",
+                "tan": "Tax Deduction/Collection Account Number."
+            },
+        }
+
+    # Generic fallback
     return {
-        "country": c,
+        "country": code,
         "base_fields": ["legal_name","country","address_line1","city","state_region","postal_code","tax_id"],
         "gating": [
-            {"key":"employ_in_country","type":"bool"},
-            {"key":"sells_in_country","type":"bool"},
+            {"key":"employ_in_country","type":"bool","on_true_add":["employer_registration_id"]},
+            {"key":"sells_in_country","type":"bool","on_true_add":["indirect_tax_id"]},
             {"key":"has_tax_id","type":"bool"},
-            {"key":"regulatory_category","type":"enum","options":["none","npo","gov","fsi"]}
+            {"key":"regulatory_category","type":"enum","options":["none","npo","gov","fsi"],"map":{"fsi":["regulator_code"]}},
         ],
-        "field_hints": {}
+        "field_hints": {"tax_id": "Primary national tax identifier."},
     }
+
+
+def get_country_pack(ctry: str | None) -> dict:
+    """
+    Load a country pack from DB first; if missing or malformed, fall back to defaults.
+    Requires table `country_packs(country TEXT PRIMARY KEY, json TEXT, version TEXT, updated_at TEXT)`.
+    """
+    # Normalize country code
+    code = None
+    if ctry:
+        t = str(ctry).strip()
+        if t.lower() in {"us","usa","united states","united states of america"}:
+            code = "US"
+        else:
+            code = t.upper()
+    if not code:
+        code = "US"
+
+    # Try DB-backed pack
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("SELECT json FROM country_packs WHERE country=?", (code,))
+        row = cur.fetchone()
+        con.close()
+        if row and row[0]:
+            try:
+                pack = json.loads(row[0]) or {}
+            except Exception:
+                pack = {}
+
+            # Merge with sensible defaults to guarantee required keys
+            base = _default_pack(code)
+            merged = {
+                "country": pack.get("country", code),
+                "base_fields": pack.get("base_fields", base["base_fields"]),
+                "gating": pack.get("gating", base["gating"]),
+                "field_hints": pack.get("field_hints", base.get("field_hints", {})),
+            }
+            return merged
+    except Exception:
+        # If DB is unavailable or table missing, just fall back
+        pass
+
+    # Fallback pack (US/UK/IN specific or generic)
+    return _default_pack(code)
 
 
 
