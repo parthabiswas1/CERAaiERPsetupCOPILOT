@@ -12,6 +12,15 @@ import os, sqlite3, json, pathlib
 from ceraai.rag import RAGTool
 from ceraai.tools import RulesTool, ERPConnector, AuditTool
 from ceraai.agents import InterviewAgent, ValidatorAgent, MapperAgent, ExecutorAgent, AuditorAgent
+from typing import Any, Dict, Optional, List
+
+try:
+    from openai import OpenAI
+    _oai_client = OpenAI()
+    _ASSIST_MODEL = os.getenv("ASSIST_MODEL", "gpt-4o-mini")
+except Exception:
+    _oai_client = None
+    _ASSIST_MODEL = None
 
 
 # ---------- Config ----------
@@ -123,6 +132,94 @@ async def ensure_run_id(request: Request, call_next):
     return resp
 
 # ---------- Helpers ----------
+def _persist_state(run_id: str, st: dict):
+    """Call your save_state function safely whether it expects (**st) or (st: dict)."""
+    try:
+        # Newer signature
+        return save_state(run_id, st)
+    except TypeError:
+        # Older signature
+        return save_state(run_id, **st)
+
+def _is_user_question(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t.endswith("?"):
+        return True
+    head = t.split(" ", 1)[0].lower()
+    return head in {
+        "what", "how", "why", "where", "when", "who", "which",
+        "does", "do", "is", "are", "can", "should", "could", "would", "pls", "please"
+    }
+
+def _assist_answer_with_rag(question: str, st: dict) -> Dict[str, Any]:
+    """Answer user’s side question using RAG (+ LLM if available), then restate the current gating question."""
+    # Determine country context for filtering
+    ctry = st.get("gating", {}).get("country") or st.get("inputs", {}).get("country")
+    pack = get_country_pack(ctry)
+
+    # Ensure we know what gating question is pending (don’t advance!)
+    ask_for = st.get("current_ask_for") or next_gating_key(st, pack)
+    if ask_for and st.get("current_ask_for") is None:
+        st["current_ask_for"] = ask_for
+        _persist_state(st["run_id"] if "run_id" in st else "", st)
+
+    # RAG search
+    contexts: List[str] = []
+    try:
+        flt = {"country": pack.get("country")} if pack.get("country") else None
+        hits = rag.search(question, top_k=5, filter_=flt)
+        # normalize to texts
+        for h in (hits or []):
+            if isinstance(h, dict):
+                contexts.append(h.get("text", "") or "")
+            else:
+                contexts.append(str(h))
+    except Exception:
+        pass
+
+    # Compose an answer
+    answer: str
+    if _oai_client and _ASSIST_MODEL:
+        prompt = (
+            "You are an ERP legal-entity setup assistant. Answer briefly and factually "
+            "based on the provided context snippets. If the answer is not covered by "
+            "the context, say you don't have enough info.\n\n"
+            "Context:\n" + "\n---\n".join([c for c in contexts if c][:5]) +
+            f"\n\nUser question: {question}\nAnswer:"
+        )
+        try:
+            comp = _oai_client.chat.completions.create(
+                model=_ASSIST_MODEL,
+                temperature=0.0,
+                max_tokens=220,
+                messages=[
+                    {"role": "system", "content": "You are a concise, factual ERP assistant."},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            answer = (comp.choices[0].message.content or "").strip()
+        except Exception:
+            answer = ""
+    else:
+        # Fallback: return first snippet or a generic message
+        answer = (contexts[0][:400] if contexts else "").strip()
+
+    if not answer:
+        answer = "I don't have enough context to answer that confidently. Let's continue."
+
+    # Restate current gating question (without moving the flow)
+    next_q = gating_question(ask_for, pack) if ask_for else None
+
+    return {
+        "assist": answer,
+        "ask_for": ask_for,
+        "question": next_q,
+    }
+
+
+
 def _run_dir(run_id: str) -> pathlib.Path:
     d = UPLOAD_ROOT / run_id
     d.mkdir(parents=True, exist_ok=True)
@@ -407,52 +504,106 @@ def interview_next(request: Request, credentials: HTTPBasicCredentials = Depends
             "complete": False, "question": gating_question(ask_for, pack)}
 
 @app.post("/interview/answer")
-def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
+def interview_answer(
+    payload: Dict[str, Any],
+    request: Request,
+    credentials: HTTPBasicCredentials = Depends(security),
+):
+    if not basic_ok(credentials):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     run_id = request.state.run_id
     text = str(payload.get("text", "")).strip()
     st = load_state(run_id)
-    st.setdefault("gating", {}); st.setdefault("inputs", {})
+    st.setdefault("run_id", run_id)  # helpful for _persist_state wrapper
+    st.setdefault("gating", {})
+    st.setdefault("inputs", {})
+
+    # Pack for current (or unknown) country
     ctry = st["gating"].get("country") or st["inputs"].get("country")
     pack = get_country_pack(ctry)
 
-    ask_for = st.get("current_ask_for")
+    # If the user is asking a side question, use RAG (+ LLM) to help,
+    # but DO NOT advance the gating flow.
+    if _is_user_question(text):
+        assist = _assist_answer_with_rag(text, st)
+        # Keep the current gating key as-is (or initialize it if missing)
+        ask_for = st.get("current_ask_for") or next_gating_key(st, pack)
+        if ask_for and st.get("current_ask_for") is None:
+            st["current_ask_for"] = ask_for
+            _persist_state(run_id, st)
+
+        return {
+            "run_id": run_id,
+            "phase": "assist",
+            "assist": assist["assist"],
+            "next": {
+                "run_id": run_id,
+                "phase": "gating",
+                "ask_for": assist["ask_for"],
+                "complete": False,
+                "question": assist["question"],
+            },
+        }
+
+    # Otherwise treat as an answer to the current gating question
+    ask_for = st.get("current_ask_for") or next_gating_key(st, pack)
     if not ask_for:
-        ask_for = next_gating_key(st, pack)
-        if not ask_for:
-            st["complete"] = True
-            save_state(run_id, st)
-            return {"run_id": run_id, "phase": "gating", "accepted": True,
-                    "complete": True, "message": "Gating already complete."}
-        st["current_ask_for"] = ask_for
-        save_state(run_id, st)
+        return {
+            "run_id": run_id,
+            "phase": "gating",
+            "accepted": True,
+            "complete": True,
+            "message": "Gating already complete.",
+        }
 
     ok, res = validate_gating_answer(ask_for, text, pack)
     if not ok:
-        return {"run_id": run_id, "phase": "gating", "accepted": False,
-                "ask_for": ask_for, "message": res}
+        # stay on this question
+        return {
+            "run_id": run_id,
+            "phase": "gating",
+            "accepted": False,
+            "ask_for": ask_for,
+            "message": res,
+        }
 
-    # persist answer
+    # Persist answer
     st["gating"].update(res)
     st["inputs"].update(res)
 
-    # compute next
+    # Move to the next gating key
     next_key = next_gating_key(st, pack)
     if next_key:
         st["current_ask_for"] = next_key
-        save_state(run_id, st)
-        return {"run_id": run_id, "phase": "gating", "accepted": True,
-                "next": {"run_id": run_id, "phase": "gating",
-                         "ask_for": next_key, "complete": False,
-                         "question": gating_question(next_key, pack)}}
+        _persist_state(run_id, st)
+        return {
+            "run_id": run_id,
+            "phase": "gating",
+            "accepted": True,
+            "next": {
+                "run_id": run_id,
+                "phase": "gating",
+                "ask_for": next_key,
+                "complete": False,
+                "question": gating_question(next_key, pack),
+            },
+        }
 
-    # done
+    # Done: derive required fields and clear pending key
     st["current_ask_for"] = None
     st["complete"] = True
     st["required_fields"] = derive_required_fields(pack, st["gating"])
-    save_state(run_id, st)
-    return {"run_id": run_id, "phase": "gating", "accepted": True,
-            "complete": True, "message": "Gating questions complete. You may now download the template."}
+    _persist_state(run_id, st)
+    return {
+        "run_id": run_id,
+        "phase": "gating",
+        "accepted": True,
+        "complete": True,
+        "message": "Gating questions complete. You may now download the template.",
+    }
+
+
 
 # ---------- Template (XLSX) ----------
 def build_template_xlsx(country: str = "US", required_fields: list[str] | None = None) -> BytesIO:
