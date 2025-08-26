@@ -404,121 +404,73 @@ def interview_next(request: Request, credentials: HTTPBasicCredentials = Depends
 
     run_id = request.state.run_id
     st = load_state(run_id)
-
-    # Ensure gating dicts exist
-    if "gating" not in st:
-        st["gating"] = {}
-    if "inputs" not in st:
-        st["inputs"] = {}
+    st.setdefault("gating", {})
+    st.setdefault("inputs", {})
 
     ctry = st["gating"].get("country") or st["inputs"].get("country")
     pack = get_country_pack(ctry)
 
-    ask_for = st.get("ask_for") or next_gating_key(st, pack)
+    ask_for = st.get("current_ask_for") or next_gating_key(st, pack)
     if not ask_for:
-        return {
-            "run_id": run_id,
-            "phase": "gating",
-            "complete": True,
-            "message": "No gating question pending. You may download the template.",
-        }
+        st["complete"] = True
+        save_state(run_id, **st)
+        return {"run_id": run_id, "phase": "gating", "complete": True,
+                "message": "All gating questions answered."}
 
-    st["ask_for"] = ask_for
+    st["current_ask_for"] = ask_for
     save_state(run_id, **st)
-
-    return {
-        "run_id": run_id,
-        "phase": "gating",
-        "ask_for": ask_for,
-        "complete": False,
-        "question": gating_question(ask_for, pack),
-    }
+    return {"run_id": run_id, "phase": "gating", "ask_for": ask_for,
+            "complete": False, "question": gating_question(ask_for, pack)}
 
 
 @app.post("/interview/answer")
-def interview_answer(
-    payload: dict,
-    request: Request,
-    credentials: HTTPBasicCredentials = Depends(security),
-):
+def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCredentials = Depends(security)):
     if not basic_ok(credentials):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     run_id = request.state.run_id
     text = str(payload.get("text", "")).strip()
     st = load_state(run_id)
+    st.setdefault("gating", {})
+    st.setdefault("inputs", {})
 
-    # Ensure dicts exist
-    if "gating" not in st:
-        st["gating"] = {}
-    if "inputs" not in st:
-        st["inputs"] = {}
-
-    # Figure out current pack
     ctry = st["gating"].get("country") or st["inputs"].get("country")
     pack = get_country_pack(ctry)
 
-    # What is the current gating key we’re expecting?
-    ask_for = st.get("ask_for") or next_gating_key(st, pack)
+    ask_for = st.get("current_ask_for")
     if not ask_for:
-        return {
-            "run_id": run_id,
-            "phase": "gating",
-            "accepted": False,
-            "message": "No gating question pending.",
-        }
+        ask_for = next_gating_key(st, pack)
+        if not ask_for:
+            return {"run_id": run_id, "phase": "gating", "accepted": True,
+                    "complete": True, "message": "Gating already complete."}
+        st["current_ask_for"] = ask_for
+        save_state(run_id, **st)
 
-    # Validate this answer
     ok, res = validate_gating_answer(ask_for, text, pack)
+    if not ok:
+        return {"run_id": run_id, "phase": "gating", "accepted": False,
+                "ask_for": ask_for, "message": res}
 
-    if ok:
-        # Persist this answer
-        st["gating"].update(res)
-        st["inputs"].update(res)
+    # persist answer
+    st["gating"].update(res)
+    st["inputs"].update(res)
+    st["current_ask_for"] = None  # clear current key
 
-        # Mark that we’ve finished this question
-        st["ask_for"] = None
+    next_key = next_gating_key(st, pack)
+    if next_key:
+        st["current_ask_for"] = next_key
+        save_state(run_id, **st)
+        return {"run_id": run_id, "phase": "gating", "accepted": True,
+                "next": {"run_id": run_id, "phase": "gating", "ask_for": next_key,
+                         "complete": False, "question": gating_question(next_key, pack)}}
 
-        # Check for next gating key
-        next_key = next_gating_key(st, pack)
-        if next_key:
-            st["ask_for"] = next_key
-            save_state(run_id, **st)
-            return {
-                "run_id": run_id,
-                "phase": "gating",
-                "accepted": True,
-                "next": {
-                    "run_id": run_id,
-                    "phase": "gating",
-                    "ask_for": next_key,
-                    "complete": False,
-                    "question": gating_question(next_key, pack),
-                },
-            }
-        else:
-            # All gating complete → record required fields
-            required = derive_required_fields(pack, st["gating"])
-            st["complete"] = True
-            st["required_fields"] = required
-            save_state(run_id, **st)
-            return {
-                "run_id": run_id,
-                "phase": "gating",
-                "accepted": True,
-                "complete": True,
-                "message": "Gating questions complete. You may now download the template.",
-            }
+    # done
+    st["complete"] = True
+    st["required_fields"] = derive_required_fields(pack, st["gating"])
+    save_state(run_id, **st)
+    return {"run_id": run_id, "phase": "gating", "accepted": True,
+            "complete": True, "message": "Gating questions complete. You may now download the template."}
 
-    else:
-        # Validation failed → stay on same question
-        return {
-            "run_id": run_id,
-            "phase": "gating",
-            "accepted": False,
-            "ask_for": ask_for,
-            "message": res,
-        }
 
 
 @app.post("/map")
