@@ -1,8 +1,9 @@
+// src/App.js
 import { useEffect, useState } from "react";
 import "./styles.css";
 
 /** ===== CONFIG ===== */
-const BASE_URL = "https://ceraai-erp-setup-copilot.onrender.com"; // API URL
+const BASE_URL = "https://ceraai-erp-setup-copilot.onrender.com";
 const USER = "demo";
 const PASS = "demo";
 
@@ -37,14 +38,25 @@ export default function App() {
     return res.json();
   };
 
+  const downloadWithAuth = async (path, filename) => {
+    const res = await fetch(`${BASE_URL}${path}`, {
+      headers: { Authorization: AUTH, "X-Run-ID": runId },
+    });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename; document.body.appendChild(a); a.click();
+    a.remove(); URL.revokeObjectURL(url);
+  };
+
   /** ===== UI STATE ===== */
   const [messages, setMessages] = useState([]);
-  const [field, setField] = useState("");      // e.g., country / ein / ca_edd_id
-  const [value, setValue] = useState("");      // e.g., US / 12-3456789 / 123-4567
-  const [state, setState] = useState(null);
-  const [mapped, setMapped] = useState(null);
-  const [execRes, setExecRes] = useState(null);
-  const [audit, setAudit] = useState([]);
+  const [text, setText] = useState("");        // free-text answer
+  const [file, setFile] = useState(null);      // uploaded xlsx
+  const [issues, setIssues] = useState([]);    // validation issues
+  const [state, setState] = useState(null);    // backend state (/state)
+  const [ready, setReady] = useState(false);   // interview satisfied
   const [error, setError] = useState("");
 
   /** ===== ACTIONS ===== */
@@ -52,20 +64,34 @@ export default function App() {
     setError("");
     try {
       const data = await api("/interview/next");
-      setMessages((m) => [...m, { sender: "ceraai", text: data.question }]);
+      setReady(Boolean(data.complete));
+      setMessages((m) => [
+        ...m,
+        { sender: "ceraai", text: data.question || (data.complete ? "I can generate your template now." : "Provide more details.") },
+      ]);
       await refreshState();
     } catch (e) {
       setError(String(e.message || e));
     }
   };
 
-  const submitAnswer = async () => {
-    if (!field || !value) return;
+  const submitFreeText = async () => {
+    if (!text.trim()) return;
     setError("");
     try {
-      setMessages((m) => [...m, { sender: "user", text: `${field}: ${value}` }]);
-      await api("/interview/answer", { method: "POST", body: { field, value } });
-      setField(""); setValue("");
+      setMessages((m) => [...m, { sender: "user", text }]);
+      const res = await api("/interview/answer", { method: "POST", body: { text } });
+      setText("");
+      setReady(Boolean(res.complete));
+      setMessages((m) => [
+        ...m,
+        {
+          sender: "ceraai",
+          text: res.complete
+            ? "I have enough to generate your Legal Entity template."
+            : (res.missing?.length ? `Noted. Still need: ${res.missing.map(x => x.field).join(", ")}` : "Noted."),
+        },
+      ]);
       await refreshState();
     } catch (e) {
       setError(String(e.message || e));
@@ -82,36 +108,42 @@ export default function App() {
     }
   };
 
-  const runMap = async () => {
+  const downloadTemplate = async () => {
     setError("");
     try {
-      const res = await api("/map", { method: "POST", body: {} });
-      setMapped(res.mapped);
-      await refreshState();
+      await downloadWithAuth("/template/draft", "legal_entity_template.xlsx");
     } catch (e) {
       setError(String(e.message || e));
     }
   };
 
-  const runExecute = async () => {
+  const uploadAndValidate = async () => {
+    if (!file) return;
     setError("");
     try {
-      const res = await api("/execute", {
+      const fd = new FormData();
+      fd.append("file", file);
+      const up = await fetch(`${BASE_URL}/files/upload`, {
         method: "POST",
-        body: {}, // uses mapped payload saved in state
-        headers: { "Idempotency-Key": "ui-exec-1" },
+        headers: { Authorization: AUTH, "X-Run-ID": runId },
+        body: fd,
       });
-      setExecRes(res);
+      if (!up.ok) throw new Error(`${up.status} ${up.statusText}`);
+      const res = await api("/files/validate", { method: "POST" });
+      setIssues(res.issues || []);
+      setMessages((m) => [
+        ...m,
+        { sender: "ceraai", text: (res.issues?.length ? `Found ${res.issues.length} issue(s). Download review for details.` : "Template is error-free.") },
+      ]);
     } catch (e) {
       setError(String(e.message || e));
     }
   };
 
-  const loadAudit = async () => {
+  const downloadReview = async () => {
     setError("");
     try {
-      const res = await api(`/audit/logs?run_id=${encodeURIComponent(runId)}`);
-      setAudit(res.logs || []);
+      await downloadWithAuth("/files/review", "review.xlsx");
     } catch (e) {
       setError(String(e.message || e));
     }
@@ -132,10 +164,8 @@ export default function App() {
         {/* Sidebar */}
         <aside className="sidebar">
           <div className="step">🗨️ Interview</div>
-          <div className="step">✅ Validator</div>
-          <div className="step">🔄 Mapper</div>
-          <div className="step">🚀 Executor</div>
-          <div className="step">📜 Auditor</div>
+          <div className="step">📄 Template</div>
+          <div className="step">⬆️ Upload & Validate</div>
         </aside>
 
         {/* Main */}
@@ -158,25 +188,21 @@ export default function App() {
                 </div>
               ))}
             </div>
-            <div className="chat-input">
-              <input
-                placeholder="field (e.g., country, ein, ca_edd_id)"
-                value={field}
-                onChange={(e) => setField(e.target.value)}
+            <div className="chat-input" style={{ gridTemplateColumns: "1fr auto" }}>
+              <textarea
+                placeholder="Type your answer in natural language…"
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+                style={{ resize: "vertical", minHeight: 60 }}
               />
-              <input
-                placeholder="value"
-                value={value}
-                onChange={(e) => setValue(e.target.value)}
-              />
-              <button className="btn primary" onClick={submitAnswer}>Submit</button>
+              <button className="btn primary" onClick={submitFreeText}>Send</button>
             </div>
           </section>
 
           {/* Validator / State */}
           <section className="card">
             <div className="card-head">
-              <h2>Validator / State</h2>
+              <h2>State</h2>
               <div className="actions">
                 <button className="btn" onClick={refreshState}>Refresh</button>
               </div>
@@ -184,44 +210,35 @@ export default function App() {
             <pre className="code">{JSON.stringify(state || {}, null, 2)}</pre>
           </section>
 
-          {/* Mapper */}
+          {/* Template + Upload/Validate */}
           <section className="card">
             <div className="card-head">
-              <h2>Mapper</h2>
-              <div className="actions">
-                <button className="btn primary" onClick={runMap}>Run Mapper</button>
+              <h2>Template & Validation</h2>
+              <div className="actions" style={{ display: "flex", gap: 8 }}>
+                <button className="btn" onClick={downloadTemplate} disabled={!ready}>
+                  Download Template (XLSX)
+                </button>
+                <input type="file" accept=".xlsx" onChange={(e) => setFile(e.target.files?.[0] || null)} />
+                <button className="btn" onClick={uploadAndValidate}>
+                  Upload & Validate
+                </button>
+                <button className="btn" onClick={downloadReview}>
+                  Download Review
+                </button>
               </div>
             </div>
-            <pre className="code">{JSON.stringify(mapped || {}, null, 2)}</pre>
-          </section>
-
-          {/* Executor */}
-          <section className="card">
-            <div className="card-head">
-              <h2>Executor</h2>
-              <div className="actions">
-                <button className="btn success" onClick={runExecute}>Execute (Idempotent)</button>
+            {issues.length > 0 ? (
+              <div className="error" style={{ margin: 12 }}>
+                Found {issues.length} issue(s):{" "}
+                {issues.map((i, idx) => (
+                  <span key={idx}>{i.field}@row{i.row}{idx < issues.length - 1 ? ", " : ""}</span>
+                ))}
               </div>
-            </div>
-            <pre className="code">{JSON.stringify(execRes || {}, null, 2)}</pre>
-          </section>
-
-          {/* Auditor */}
-          <section className="card">
-            <div className="card-head">
-              <h2>Audit Trail</h2>
-              <div className="actions">
-                <button className="btn" onClick={loadAudit}>Refresh Audit</button>
+            ) : (
+              <div style={{ padding: 12, color: "#6b7280" }}>
+                {ready ? "Ready: You can download the template now." : "Waiting for enough info to generate the template."}
               </div>
-            </div>
-            <ul className="audit">
-              {(audit || []).map((e, i) => (
-                <li key={i}>
-                  <span className="dim">{e.timestamp}</span> — {e.action || e.entity || "event"}
-                  {e.run_id ? <> (<code>{e.run_id}</code>)</> : null}
-                </li>
-              ))}
-            </ul>
+            )}
           </section>
         </main>
       </div>
