@@ -3,25 +3,26 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from uuid import uuid4
-from datetime import datetime
 from io import BytesIO
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill
+from datetime import datetime
 
-import os, sqlite3, json, pathlib, time
-from typing import Dict
+import os, sqlite3, json, pathlib
 
-# --- CERA agents/tools (as in your repo) ---
+# --- External tools/agents you already have ---
 from ceraai.tools import RAGTool, RulesTool, ERPConnector, AuditTool
 from ceraai.agents import InterviewAgent, ValidatorAgent, MapperAgent, ExecutorAgent, AuditorAgent
 
-# ------------------- Config -------------------
+# ---------- Config ----------
 DB_PATH = os.getenv("DB_PATH", str(pathlib.Path("/tmp/ceraai.db")))
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # TODO: pin to your UI origin
-UPLOAD_ROOT = pathlib.Path("/tmp/ceraai_uploads"); UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
+UPLOAD_ROOT = pathlib.Path("/tmp/ceraai_uploads")
+UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="CERAai ERP Setup Copilot - MVP")
 security = HTTPBasic()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONTEND_ORIGIN],
@@ -30,21 +31,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------- Basic Auth -------------------
-def basic_ok(creds: HTTPBasicCredentials):
-    return (creds.username == os.getenv("DEMO_USER", "demo")
-            and creds.password == os.getenv("DEMO_PASS", "demo"))
-
-# ------------------- Run-ID middleware -------------------
-@app.middleware("http")
-async def ensure_run_id(request: Request, call_next):
-    rid = request.headers.get("x-run-id") or str(uuid4())
-    request.state.run_id = rid
-    resp = await call_next(request)
-    resp.headers["X-Run-ID"] = rid
-    return resp
-
-# ------------------- Tools/Agents -------------------
+# ---------- Agents/Tools ----------
 rag = RAGTool()
 rules_tool = RulesTool(DB_PATH)
 interview_agent = InterviewAgent()
@@ -55,142 +42,93 @@ auditor_agent   = AuditorAgent()
 audit_tool      = AuditTool()
 mapper_agent    = MapperAgent()
 
-def _run_dir(run_id: str) -> pathlib.Path:
-    d = UPLOAD_ROOT / run_id
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+# ---------- DB bootstrap (JSON state) ----------
+def init_db():
+    con = sqlite3.connect(DB_PATH); cur = con.cursor()
+    # Base table (keep name 'runs' but ensure a 'state' JSON column exists)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS runs (
+      run_id TEXT PRIMARY KEY
+    )
+    """)
+    # Add columns if missing
+    def _add(col, ddl):
+        try: cur.execute(f"ALTER TABLE runs ADD COLUMN {col} {ddl}")
+        except sqlite3.OperationalError: pass
 
-# =====================================================
-#                STATE: DB + In-Memory
-# =====================================================
-MEM_STATE: Dict[str, dict] = {}  # fallback/merge for robustness
+    _add("state", "TEXT")  # single source of truth
+    _add("created_at", "TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
+    _add("updated_at", "TEXT")
+    con.commit(); con.close()
 
-def _jdump(x):
-    return json.dumps(x) if x is not None else None
+def default_state(run_id: str) -> dict:
+    return {
+        "run_id": run_id,
+        "inputs": {},
+        "missing": [],
+        "mapped": None,
+        "result": None,
+        "gating": {},
+        "phase": "gating",
+        "required_fields": None,
+        "current_ask_for": None,
+        "complete": False,
+    }
 
-def _jload(s, default):
+def jdump(x): return json.dumps(x, ensure_ascii=False)
+def jload(s, default):
     try:
         return json.loads(s) if s not in (None, "") else default
     except Exception:
         return default
 
-def _ensure_runs_table():
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS runs (
-      run_id TEXT PRIMARY KEY,
-      inputs TEXT DEFAULT '{}',
-      missing TEXT DEFAULT '[]',
-      mapped TEXT,
-      result TEXT
-    )""")
-    # Migrations: add columns if missing
-    def _add(col, ddl):
-        try:
-            cur.execute(f"ALTER TABLE runs ADD COLUMN {col} {ddl}")
-        except sqlite3.OperationalError:
-            pass
-    _add("gating", "TEXT DEFAULT '{}'")
-    _add("phase", "TEXT DEFAULT 'gating'")
-    _add("required_fields", "TEXT")
-    _add("current_ask_for", "TEXT")
-    _add("created_at", "TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
-    _add("updated_at", "TEXT")
-    con.commit(); con.close()
-
-def init_db():
-    _ensure_runs_table()
-
-@app.on_event("startup")
-def _startup():
-    init_db()
-
 def load_state(run_id: str) -> dict:
-    _ensure_runs_table()
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("""SELECT inputs, missing, mapped, result, gating, phase, required_fields, current_ask_for
-                   FROM runs WHERE run_id=?""", (run_id,))
+    cur.execute("SELECT state FROM runs WHERE run_id=?", (run_id,))
     row = cur.fetchone(); con.close()
-
-    base = {
-        "run_id": run_id,
-        "inputs": {}, "missing": [], "mapped": None, "result": None,
-        "gating": {}, "phase": "gating", "required_fields": None,
-        "current_ask_for": None, "complete": False,
-    }
-
-    if row:
-        inputs, missing, mapped, result, gating, phase, required_fields, current_ask_for = row
-        base.update({
-            "inputs": _jload(inputs, {}),
-            "missing": _jload(missing, []),
-            "mapped": _jload(mapped, None),
-            "result": _jload(result, None),
-            "gating": _jload(gating, {}),
-            "phase": (phase or "gating"),
-            "required_fields": _jload(required_fields, None),
-            "current_ask_for": current_ask_for,
-        })
-
-    # Merge in-memory fallback for safety (DB-first, MEM fills gaps)
-    mem = MEM_STATE.get(run_id, {})
-    if base.get("current_ask_for") is None and mem.get("current_ask_for") is not None:
-        base["current_ask_for"] = mem["current_ask_for"]
-    if not base.get("gating") and mem.get("gating"):
-        base["gating"] = mem["gating"]
-    if not base.get("inputs") and mem.get("inputs"):
-        base["inputs"] = mem["inputs"]
-    if base.get("required_fields") is None and mem.get("required_fields") is not None:
-        base["required_fields"] = mem["required_fields"]
+    if not row:
+        return default_state(run_id)
+    st = jload(row[0], {}) if row[0] else {}
+    # Ensure required keys exist
+    base = default_state(run_id)
+    base.update(st or {})
     return base
 
-def save_state(run_id: str, **st):
-    # Defensive: callers often pass st that already includes 'run_id'
-    st = dict(st)
-    st.pop("run_id", None)
-
+def save_state(run_id: str, st: dict):
+    # Never pass **st; always pass dict
+    sjson = jdump({k: v for k, v in st.items() if k != "run_id"})
+    now = datetime.utcnow().isoformat() + "Z"
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    # Ensure row exists
     cur.execute("INSERT OR IGNORE INTO runs (run_id) VALUES (?)", (run_id,))
-
-    # Discover existing columns
-    cols_info = cur.execute("PRAGMA table_info(runs)").fetchall()
-    existing = {c[1] for c in cols_info}
-
-    def _jdump(x):
-        return json.dumps(x) if x is not None else None
-
-    values_map = {
-        "inputs": _jdump(st.get("inputs", {})),
-        "missing": _jdump(st.get("missing", [])),
-        "mapped": _jdump(st.get("mapped", None)),
-        "result": _jdump(st.get("result", None)),
-        "gating": _jdump(st.get("gating", {})),
-        "phase": st.get("phase", "gating"),
-        "required_fields": _jdump(st.get("required_fields", None)),
-        "current_ask_for": st.get("current_ask_for"),
-        "updated_at": datetime.utcnow().isoformat() + "Z",
-    }
-
-    set_cols, set_vals = [], []
-    for col, val in values_map.items():
-        if col in existing:
-            set_cols.append(f"{col}=?")
-            set_vals.append(val)
-    set_vals.append(run_id)
-
-    cur.execute(f"UPDATE runs SET {', '.join(set_cols)} WHERE run_id=?", set_vals)
+    cur.execute("UPDATE runs SET state=?, updated_at=? WHERE run_id=?", (sjson, now, run_id))
     con.commit(); con.close()
 
+# ---------- Middleware ----------
+@app.middleware("http")
+async def ensure_run_id(request: Request, call_next):
+    rid = request.headers.get("x-run-id") or str(uuid4())
+    request.state.run_id = rid
+    resp = await call_next(request)
+    resp.headers["X-Run-ID"] = rid
+    return resp
 
+# ---------- Helpers ----------
+def _run_dir(run_id: str) -> pathlib.Path:
+    d = UPLOAD_ROOT / run_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
-# =====================================================
-#                 Business Logic helpers
-# =====================================================
+def basic_ok(creds: HTTPBasicCredentials):
+    return (
+        creds.username == os.getenv("DEMO_USER", "demo") and
+        creds.password == os.getenv("DEMO_PASS", "demo")
+    )
+
+# Gating logic
 GATING_ORDER = ["country","employ_in_country","sells_in_country","has_tax_id","regulatory_category"]
 
 def get_country_pack(ctry: str | None):
-    # TODO: RAG (Pinecone) lookup; fallback for now
+    # TODO: swap to Pinecone RAG; fallback pack
     return {
       "country": (ctry or "US").upper(),
       "base_fields": ["legal_name","country","address_line1","city","state_region","postal_code","ein"],
@@ -198,16 +136,14 @@ def get_country_pack(ctry: str | None):
         {"key":"employ_in_country","type":"bool","on_true_add":["employer_registration_id"]},
         {"key":"sells_in_country","type":"bool","on_true_add":["indirect_tax_id"]},
         {"key":"has_tax_id","type":"bool"},
-        {"key":"regulatory_category","type":"enum","options":["none","npo","gov","fsi"],
-         "map":{"fsi":["regulator_code"]}}
+        {"key":"regulatory_category","type":"enum","options":["none","npo","gov","fsi"],"map":{"fsi":["regulator_code"]}}
       ],
       "field_hints": {"ein":"Format NN-NNNNNNN.","indirect_tax_id":"Sales/VAT permit if selling."}
     }
 
 def normalize_country(text: str) -> str | None:
     t = text.strip().lower()
-    if t in {"us","usa","united states","united states of america"}:
-        return "US"
+    if t in {"us","usa","united states","united states of america"}: return "US"
     return t.upper() if len(t) == 2 else None
 
 def parse_bool(text: str) -> bool | None:
@@ -220,7 +156,7 @@ def _reg_opts(pack: dict) -> set:
     for g in pack.get("gating", []):
         if g.get("key") == "regulatory_category":
             return set(g.get("options", []))
-    return {"none","npo","gov","fsi"}  # fallback
+    return {"none","npo","gov","fsi"}
 
 def validate_gating_answer(key: str, text: str, pack: dict):
     if key == "country":
@@ -260,43 +196,53 @@ def derive_required_fields(pack: dict, gating: dict) -> list[str]:
             req += g["on_true_add"]
         if isinstance(v, str) and g.get("type") == "enum":
             req += (g.get("map") or {}).get(v, [])
-    return list(dict.fromkeys(req))  # de-dup, preserve order
+    return list(dict.fromkeys(req))
 
-# =====================================================
-#                   Misc helpers
-# =====================================================
-def parse_address_block(txt: str) -> dict | None:
-    parts = [p.strip() for p in txt.split(",")]
-    if len(parts) < 4:
-        return None
-    return {"address_line1": parts[0], "city": parts[1], "state_region": parts[2], "postal_code": parts[3]}
-
-# =====================================================
-#                       Routes
-# =====================================================
+# ---------- Basic routes ----------
 @app.get("/")
-def root():
-    return {"service": "CERAaiERPsetupCOPILOT", "status": "ok"}
+def root(): return {"service": "CERAaiERPsetupCOPILOT", "status": "ok"}
 
 @app.get("/health")
-def health():
-    return {"ok": True}
+def health(): return {"ok": True}
 
 @app.get("/secure-check")
 def secure_check(credentials: HTTPBasicCredentials = Depends(security)):
     if basic_ok(credentials): return {"access": "granted"}
     raise HTTPException(status_code=401, detail="Unauthorized")
 
+# ---------- State ----------
+@app.get("/state")
+def get_state(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
+    if not basic_ok(credentials): raise HTTPException(status_code=401)
+    st = load_state(request.state.run_id)
+    return st
+
+# ---------- Validator/Mapper/Execute (unchanged except save_state signature safe) ----------
 @app.post("/validate")
 def validate(payload: dict, request: Request, credentials: HTTPBasicCredentials = Depends(security)):
     if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
     res = validator_agent.validate(payload, rules_tool)
     return {"run_id": request.state.run_id, **res}
 
-@app.get("/state")
-def get_state(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
+@app.post("/map")
+def map_to_fusion(payload: dict | None = None, request: Request = None,
+                  credentials: HTTPBasicCredentials = Depends(security)):
     if not basic_ok(credentials): raise HTTPException(status_code=401)
-    return {"run_id": request.state.run_id, **load_state(request.state.run_id)}
+    st = load_state(request.state.run_id)
+    if payload:
+        st["inputs"].update(payload)
+    res = validator_agent.validate(st["inputs"], rules_tool)
+    if res["status"] != "ok":
+        st["missing"] = res["missing"]
+        save_state(request.state.run_id, st)
+        raise HTTPException(status_code=422, detail={"missing": res["missing"]})
+    mapped = mapper_agent.map_to_fusion(st["inputs"])
+    st["mapped"] = mapped
+    save_state(request.state.run_id, st)
+    return {"run_id": request.state.run_id, "status": "ok", "mapped": mapped}
+
+def idem_get(scope, key): return None
+def idem_put(scope, key, value): pass
 
 @app.post("/execute")
 def execute(payload: dict | None = None, request: Request = None,
@@ -311,15 +257,12 @@ def execute(payload: dict | None = None, request: Request = None,
         cached = idem_get("execute", idem_key)
         if cached: return {"run_id": request.state.run_id, **cached}
     res = executor_agent.execute(work, erp_connector)
-    st["result"] = res; save_state(request.state.run_id, **st)
+    st["result"] = res
+    save_state(request.state.run_id, st)
     if idem_key: idem_put("execute", idem_key, res)
     return {"run_id": request.state.run_id, **res}
 
-# (Simple in-memory idempotency for demo)
-_IDEM = {}
-def idem_get(kind: str, key: str): return _IDEM.get((kind, key))
-def idem_put(kind: str, key: str, value: dict): _IDEM[(kind, key)] = value
-
+# ---------- Audit ----------
 @app.post("/audit")
 def audit(event: dict, request: Request, credentials: HTTPBasicCredentials = Depends(security)):
     if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
@@ -333,38 +276,33 @@ def audit_logs(run_id: str | None = None, limit: int = 200,
     data = auditor_agent.fetch(audit_tool, limit)["logs"]
     return {"logs": [e for e in data if not run_id or e.get("run_id") == run_id]}
 
-# ---------------- Interview: NEXT ----------------
+# ---------- Interview (gating Q&A) ----------
 @app.get("/interview/next")
 def interview_next(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
     if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
     run_id = request.state.run_id
     st = load_state(run_id)
     st.setdefault("gating", {}); st.setdefault("inputs", {})
-
     ctry = st["gating"].get("country") or st["inputs"].get("country")
     pack = get_country_pack(ctry)
-
     ask_for = st.get("current_ask_for") or next_gating_key(st, pack)
     if not ask_for:
-        st["complete"] = True; save_state(run_id, **st)
+        st["complete"] = True
+        save_state(run_id, st)
         return {"run_id": run_id, "phase": "gating", "complete": True,
                 "message": "All gating questions answered."}
-
     st["current_ask_for"] = ask_for
-    save_state(run_id, **st)
+    save_state(run_id, st)
     return {"run_id": run_id, "phase": "gating", "ask_for": ask_for,
             "complete": False, "question": gating_question(ask_for, pack)}
 
-# ---------------- Interview: ANSWER ----------------
 @app.post("/interview/answer")
 def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCredentials = Depends(security)):
     if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
-
     run_id = request.state.run_id
     text = str(payload.get("text", "")).strip()
     st = load_state(run_id)
     st.setdefault("gating", {}); st.setdefault("inputs", {})
-
     ctry = st["gating"].get("country") or st["inputs"].get("country")
     pack = get_country_pack(ctry)
 
@@ -372,75 +310,64 @@ def interview_answer(payload: dict, request: Request, credentials: HTTPBasicCred
     if not ask_for:
         ask_for = next_gating_key(st, pack)
         if not ask_for:
+            st["complete"] = True
+            save_state(run_id, st)
             return {"run_id": run_id, "phase": "gating", "accepted": True,
                     "complete": True, "message": "Gating already complete."}
         st["current_ask_for"] = ask_for
-        save_state(run_id, **st)
+        save_state(run_id, st)
 
     ok, res = validate_gating_answer(ask_for, text, pack)
     if not ok:
         return {"run_id": run_id, "phase": "gating", "accepted": False,
                 "ask_for": ask_for, "message": res}
 
-    # Persist this answer
+    # persist answer
     st["gating"].update(res)
     st["inputs"].update(res)
 
-    # Compute next
+    # compute next
     next_key = next_gating_key(st, pack)
     if next_key:
         st["current_ask_for"] = next_key
-        save_state(run_id, **st)
+        save_state(run_id, st)
         return {"run_id": run_id, "phase": "gating", "accepted": True,
-                "next": {"run_id": run_id, "phase": "gating", "ask_for": next_key,
-                         "complete": False, "question": gating_question(next_key, pack)}}
+                "next": {"run_id": run_id, "phase": "gating",
+                         "ask_for": next_key, "complete": False,
+                         "question": gating_question(next_key, pack)}}
 
-    # Done
+    # done
     st["current_ask_for"] = None
     st["complete"] = True
     st["required_fields"] = derive_required_fields(pack, st["gating"])
-    save_state(run_id, **st)
+    save_state(run_id, st)
     return {"run_id": run_id, "phase": "gating", "accepted": True,
             "complete": True, "message": "Gating questions complete. You may now download the template."}
 
-# ---------------- Mapping (kept for later) ----------------
-@app.post("/map")
-def map_to_fusion(payload: dict | None = None, request: Request = None,
-                  credentials: HTTPBasicCredentials = Depends(security)):
-    if not basic_ok(credentials): raise HTTPException(status_code=401)
-    st = load_state(request.state.run_id)
-    if payload:  # allow overriding/adding
-        st["inputs"].update(payload)
-
-    res = validator_agent.validate(st["inputs"], rules_tool)
-    if res["status"] != "ok":
-        save_state(request.state.run_id, inputs=st["inputs"], missing=res["missing"])
-        raise HTTPException(status_code=422, detail={"missing": res["missing"]})
-
-    mapped = mapper_agent.map_to_fusion(st["inputs"])
-    st["mapped"] = mapped; save_state(request.state.run_id, **st)
-    return {"run_id": request.state.run_id, "status":"ok", "mapped": mapped}
-
-# ---------------- Dynamic XLSX template ----------------
+# ---------- Template (XLSX) ----------
 def build_template_xlsx(country: str = "US", required_fields: list[str] | None = None) -> BytesIO:
     wb = Workbook(); ws = wb.active; ws.title = "LegalEntity"
     ctry = (country or "US").upper()
-
     if required_fields and isinstance(required_fields, list) and required_fields:
         cols = required_fields
     else:
         base_cols = ["legal_name","country","address_line1","city","state_region","postal_code"]
         cols = base_cols + (["ein"] if ctry == "US" else ["tax_id"])
     ws.append(cols)
-
     demo_map = {
-        "legal_name": "ABC, Inc.", "country": ctry, "address_line1": "123 Main St",
-        "city": "San Jose", "state_region": "CA", "postal_code": "95110",
-        "ein": "12-3456789", "tax_id": "TAX-XXX",
-        "employer_registration_id": "", "indirect_tax_id": "", "regulator_code": "",
+        "legal_name": "ABC, Inc.",
+        "country": ctry,
+        "address_line1": "123 Main St",
+        "city": "San Jose",
+        "state_region": "CA",
+        "postal_code": "95110",
+        "ein": "12-3456789",
+        "tax_id": "TAX-XXX",
+        "employer_registration_id": "",
+        "indirect_tax_id": "",
+        "regulator_code": "",
     }
     ws.append([demo_map.get(c, "") for c in cols])
-
     buf = BytesIO(); wb.save(buf); buf.seek(0); return buf
 
 @app.get("/template/draft")
@@ -448,8 +375,7 @@ def template_draft(request: Request, country: str | None = None,
                    credentials: HTTPBasicCredentials = Depends(security)):
     if not basic_ok(credentials): raise HTTPException(status_code=401, detail="Unauthorized")
     st = load_state(request.state.run_id)
-    ctry = (country or st.get("gating", {}).get("country")
-                    or st.get("inputs", {}).get("country") or "US").upper()
+    ctry = (country or st.get("gating", {}).get("country") or st.get("inputs", {}).get("country") or "US").upper()
     fields = st.get("required_fields")
     xlsx = build_template_xlsx(ctry, fields)
     return StreamingResponse(
@@ -458,7 +384,7 @@ def template_draft(request: Request, country: str | None = None,
         headers={"Content-Disposition": f'attachment; filename="legal_entity_template_{ctry}.xlsx"'}
     )
 
-# ---------------- Files: upload & validate ----------------
+# ---------- File upload/validate ----------
 @app.post("/files/upload")
 async def files_upload(request: Request, file: UploadFile = File(...),
                        credentials: HTTPBasicCredentials = Depends(security)):
@@ -478,7 +404,6 @@ def files_validate(request: Request, credentials: HTTPBasicCredentials = Depends
     p = _run_dir(request.state.run_id) / "uploaded.xlsx"
     if not p.exists():
         raise HTTPException(status_code=400, detail="No uploaded file for this run. POST /files/upload first.")
-
     wb = load_workbook(p); ws = wb.active
     headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
     issues = []
@@ -524,3 +449,8 @@ def files_review(request: Request, credentials: HTTPBasicCredentials = Depends(s
         raise HTTPException(status_code=404, detail="No review file for this run.")
     return FileResponse(review_path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         filename="review.xlsx")
+
+# ---------- Startup ----------
+@app.on_event("startup")
+def boot():
+    init_db()
