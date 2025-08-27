@@ -529,7 +529,7 @@ def interview_answer(
     run_id = request.state.run_id
     text = str(payload.get("text", "")).strip()
     st = load_state(run_id)
-    st.setdefault("run_id", run_id)
+    #st.setdefault("run_id", run_id)
     st.setdefault("gating", {})
     st.setdefault("inputs", {})
 
