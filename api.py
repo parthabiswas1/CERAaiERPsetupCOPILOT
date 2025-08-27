@@ -132,18 +132,6 @@ async def ensure_run_id(request: Request, call_next):
     return resp
 
 # ---------- Helpers ----------
-def looks_like_question(t: str) -> bool:
-    t = (t or "").strip()
-    if not t:
-        return False
-    if t.endswith("?"):
-        return True
-    qwords = {"what","why","how","where","when","which","who","whom","whose", "please", "get",
-              "do","does","did","is","are","can","could","should","would","explain","meaning"}
-    first = t.split()[0].lower()
-    return first in qwords
-
-
 
 def _persist_state(run_id: str, st: dict):
     """Call your save_state function safely whether it expects (**st) or (st: dict)."""
@@ -155,16 +143,28 @@ def _persist_state(run_id: str, st: dict):
         return save_state(run_id, **st)
 
 def _is_user_question(text: str) -> bool:
-    t = (text or "").strip()
+    """
+    Heuristic check if the user input is a side question
+    (vs. an answer to the gating flow).
+    """
+    t = (text or "").strip().lower()
     if not t:
         return False
+
+    # Explicit question mark at the end
     if t.endswith("?"):
         return True
-    head = t.split(" ", 1)[0].lower()
-    return head in {
-        "what", "how", "why", "where", "when", "who", "which",
-        "does", "do", "is", "are", "can", "should", "could", "would", "pls", "please"
+
+    # Common question "heads"
+    qwords = {
+        "what", "why", "how", "where", "when", "which", "who", "whom", "whose",
+        "do", "does", "did", "is", "are", "can", "could", "should", "would",
+        "pls", "please", "get", "explain", "meaning"
     }
+
+    first = t.split(" ", 1)[0]
+    return first in qwords
+
 
 def _assist_answer_with_rag(question: str, st: dict) -> Dict[str, Any]:
     """Answer user’s side question using RAG (+ LLM if available), then restate the current gating question."""
@@ -528,21 +528,20 @@ def interview_answer(
 
     run_id = request.state.run_id
     text = str(payload.get("text", "")).strip()
-
-    # Load & normalize state
     st = load_state(run_id)
     st.setdefault("run_id", run_id)
     st.setdefault("gating", {})
     st.setdefault("inputs", {})
 
-    # Current country pack (may be None on first question)
+    # Pack for current (or unknown) country
     ctry = st["gating"].get("country") or st["inputs"].get("country")
     pack = get_country_pack(ctry)
 
-    # 1) If the user asked a side question, answer via RAG and restate the gating question
+    # Detect side question (even if we are mid-enum)
     if _is_user_question(text):
         assist = _assist_answer_with_rag(text, st)
-        # keep (or initialize) the current gating key
+
+        # Ensure we don’t lose the gating flow
         ask_for = st.get("current_ask_for") or next_gating_key(st, pack)
         if ask_for and st.get("current_ask_for") is None:
             st["current_ask_for"] = ask_for
@@ -555,16 +554,15 @@ def interview_answer(
             "next": {
                 "run_id": run_id,
                 "phase": "gating",
-                "ask_for": assist["ask_for"],
+                "ask_for": ask_for,
                 "complete": False,
-                "question": assist["question"],
+                "question": gating_question(ask_for, pack),
             },
         }
 
-    # 2) Otherwise treat as an answer to the current gating question
+    # Otherwise treat as gating answer
     ask_for = st.get("current_ask_for") or next_gating_key(st, pack)
     if not ask_for:
-        # nothing pending; already complete
         return {
             "run_id": run_id,
             "phase": "gating",
@@ -575,7 +573,7 @@ def interview_answer(
 
     ok, res = validate_gating_answer(ask_for, text, pack)
     if not ok:
-        # stay on this question
+        # Stay on this gating question
         return {
             "run_id": run_id,
             "phase": "gating",
@@ -584,11 +582,11 @@ def interview_answer(
             "message": res,
         }
 
-    # Persist the accepted answer
+    # Persist valid gating answer
     st["gating"].update(res)
     st["inputs"].update(res)
 
-    # Find the next gating key
+    # Advance to next gating key
     next_key = next_gating_key(st, pack)
     if next_key:
         st["current_ask_for"] = next_key
@@ -606,7 +604,7 @@ def interview_answer(
             },
         }
 
-    # All gating complete → derive required fields & mark complete
+    # Done: derive required fields
     st["current_ask_for"] = None
     st["complete"] = True
     st["required_fields"] = derive_required_fields(pack, st["gating"])
@@ -616,7 +614,7 @@ def interview_answer(
         "phase": "gating",
         "accepted": True,
         "complete": True,
-        "message": "Initial questions complete. You may now download the template.",
+        "message": "Gating questions complete. You may now download the template.",
     }
 
 
