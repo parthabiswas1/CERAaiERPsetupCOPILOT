@@ -134,13 +134,9 @@ async def ensure_run_id(request: Request, call_next):
 # ---------- Helpers ----------
 
 def _persist_state(run_id: str, st: dict):
-    """Call your save_state function safely whether it expects (**st) or (st: dict)."""
-    try:
-        # Newer signature
-        return save_state(run_id, st)
-    except TypeError:
-        # Older signature
-        return save_state(run_id, **st)
+    """Always persist via the new save_state(run_id, st_dict) signature."""
+    save_state(run_id, dict(st))  # shallow copy; save_state already strips 'run_id' if present
+
 
 def _is_user_question(text: str) -> bool:
     """
@@ -529,7 +525,6 @@ def interview_answer(
     run_id = request.state.run_id
     text = str(payload.get("text", "")).strip()
     st = load_state(run_id)
-    #st.setdefault("run_id", run_id)
     st.setdefault("gating", {})
     st.setdefault("inputs", {})
 
@@ -537,15 +532,15 @@ def interview_answer(
     ctry = st["gating"].get("country") or st["inputs"].get("country")
     pack = get_country_pack(ctry)
 
-    # Detect side-questions → RAG response
+    # Detect side-questions → RAG response (do not advance gating)
     if _is_user_question(text):
         assist = _assist_answer_with_rag(text, st)
 
-        # Keep gating key unchanged
+        # Keep gating key unchanged (initialize if missing)
         ask_for = st.get("current_ask_for") or next_gating_key(st, pack)
         if ask_for:
             st["current_ask_for"] = ask_for
-            save_state(run_id, **st)
+            _persist_state(run_id, st)
 
         return {
             "run_id": run_id,
@@ -589,7 +584,7 @@ def interview_answer(
     next_key = next_gating_key(st, pack)
     if next_key:
         st["current_ask_for"] = next_key
-        save_state(run_id, **st)
+        _persist_state(run_id, st)
         return {
             "run_id": run_id,
             "phase": "gating",
@@ -607,7 +602,7 @@ def interview_answer(
     st["current_ask_for"] = None
     st["complete"] = True
     st["required_fields"] = derive_required_fields(pack, st["gating"])
-    save_state(run_id, **st)
+    _persist_state(run_id, st)
     return {
         "run_id": run_id,
         "phase": "gating",
@@ -615,6 +610,7 @@ def interview_answer(
         "complete": True,
         "message": "Initial discovery session is now complete. You may now download the template.",
     }
+
 
 
 
