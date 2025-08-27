@@ -537,20 +537,20 @@ def interview_answer(
     ctry = st["gating"].get("country") or st["inputs"].get("country")
     pack = get_country_pack(ctry)
 
-    # Detect side question (even if we are mid-enum)
+    # Detect side-questions → RAG response
     if _is_user_question(text):
         assist = _assist_answer_with_rag(text, st)
 
-        # Ensure we don’t lose the gating flow
+        # Keep gating key unchanged
         ask_for = st.get("current_ask_for") or next_gating_key(st, pack)
-        if ask_for and st.get("current_ask_for") is None:
+        if ask_for:
             st["current_ask_for"] = ask_for
-            _persist_state(run_id, st)
+            save_state(run_id, **st)
 
         return {
             "run_id": run_id,
             "phase": "assist",
-            "assist": assist["assist"],
+            "assist": assist.get("assist", "I looked that up for you."),
             "next": {
                 "run_id": run_id,
                 "phase": "gating",
@@ -560,7 +560,7 @@ def interview_answer(
             },
         }
 
-    # Otherwise treat as gating answer
+    # Otherwise, gating flow
     ask_for = st.get("current_ask_for") or next_gating_key(st, pack)
     if not ask_for:
         return {
@@ -573,7 +573,6 @@ def interview_answer(
 
     ok, res = validate_gating_answer(ask_for, text, pack)
     if not ok:
-        # Stay on this gating question
         return {
             "run_id": run_id,
             "phase": "gating",
@@ -586,11 +585,11 @@ def interview_answer(
     st["gating"].update(res)
     st["inputs"].update(res)
 
-    # Advance to next gating key
+    # Find next gating key
     next_key = next_gating_key(st, pack)
     if next_key:
         st["current_ask_for"] = next_key
-        _persist_state(run_id, st)
+        save_state(run_id, **st)
         return {
             "run_id": run_id,
             "phase": "gating",
@@ -604,17 +603,17 @@ def interview_answer(
             },
         }
 
-    # Done: derive required fields
+    # Done
     st["current_ask_for"] = None
     st["complete"] = True
     st["required_fields"] = derive_required_fields(pack, st["gating"])
-    _persist_state(run_id, st)
+    save_state(run_id, **st)
     return {
         "run_id": run_id,
         "phase": "gating",
         "accepted": True,
         "complete": True,
-        "message": "Gating questions complete. You may now download the template.",
+        "message": "Initial discovery session is now complete. You may now download the template.",
     }
 
 
